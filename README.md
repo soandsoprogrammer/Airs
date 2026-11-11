@@ -1,8 +1,10 @@
 # Airs · 多平台发布
 
-Rust + GPUI Kit 原生桌面应用。主界面由 Rust 绘制，业务与浏览器自动化也由 Rust 执行；没有 Python 运行时、网页前端开发服务器或 WebView 主界面。
+Airs 是面向自媒体创作者的 macOS 多平台发布工具，可统一管理抖音、快手和小红书的多个账号，发布短视频与图文，并跟踪发布任务。
 
-当前为 macOS Apple 芯片开发版。抖音、快手和小红书共用账号、素材、草稿和任务管理，均提供视频和图文发布入口。抖音和快手的视频流程已用真实账号验证。图文与小红书新增流程的真实账号发布仍待验收。模拟适配器用于开发测试。
+Native macOS social media publisher for Douyin, Kuaishou, and Xiaohongshu (RedNote), built with Rust and GPUI Kit.
+
+当前为 macOS Apple 芯片开发版，采用 Rust 原生界面。抖音和快手的视频流程已用真实账号验证。图文与小红书新增流程的真实账号发布仍待验收。
 
 三家平台的登录与发布流程参考 [social-auto-upload 的固定版本](docs/upstream.md)，由 Rust 适配器执行。
 
@@ -61,3 +63,19 @@ cargo run --locked -p publisher-platforms --example probe_douyin
 最后三项需要本机 Chrome；抖音探测只验证空会话可访问登录页面，不登录、不上传、不提交。本地浏览器夹具测试不接触真实平台。
 
 当前状态、验证结果与后续事项见 [开发记录](docs/verification.md)、[架构说明](docs/architecture.md) 和 [上游版本记录](docs/upstream.md)。
+
+<a name="airs-sponsor"></a>
+
+## 赞助
+
+如果 Airs 对你的创作有帮助，欢迎支持项目的持续开发。
+
+### 赞助商
+
+赞助商名称、标志及链接展示区。
+
+### 收款码
+
+| 微信收款码 | 支付宝收款码 |
+| :---: | :---: |
+| 待添加图片 | 待添加图片 |
