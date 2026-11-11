@@ -1,0 +1,12 @@
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS drafts(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS batches(id TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES batches(id), account_id TEXT NOT NULL REFERENCES accounts(id), state TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(batch_id,account_id));
+CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), started_at TEXT NOT NULL, finished_at TEXT, submitting_at TEXT, outcome TEXT, evidence TEXT);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), data TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_account ON jobs(account_id) WHERE state IN ('Preparing','Uploading','WaitingUser','Submitting');
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);

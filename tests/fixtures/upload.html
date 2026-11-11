@@ -1,0 +1,3 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>本地上传测试夹具</title>
+<body><input class="upload-btn-input" type="file" accept="video/*"><input placeholder="填写作品标题"><div class="zone-container" contenteditable="true"></div><button id="publish">发布</button><dialog id="dialog">上传已接收<button onclick="this.parentElement.close()">确定</button></dialog><p id="result">未上传</p>
+<script>let submitted=0;document.querySelector('input[type=file]').onchange=()=>{document.querySelector('#result').textContent='上传已接收';document.querySelector('#dialog').showModal()};document.querySelector('#publish').onclick=()=>submitted++;</script></body></html>

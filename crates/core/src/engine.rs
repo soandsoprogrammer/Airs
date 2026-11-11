@@ -1,0 +1,279 @@
+use crate::*;
+use anyhow::{Result, ensure};
+use async_trait::async_trait;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::{Notify, Semaphore};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+pub struct RunContext {
+    pub store: Store,
+    pub job: Job,
+    pub cancel: CancellationToken,
+}
+impl RunContext {
+    pub fn stage(&self, state: JobState, msg: &str) -> Result<()> {
+        self.store.transition(&self.job.id, state, msg)?;
+        Ok(())
+    }
+}
+#[async_trait]
+pub trait Prepared: Send {
+    async fn preflight_submission(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn submission_timeout(&self) -> Duration {
+        Duration::from_secs(120)
+    }
+    async fn submit(&mut self) -> Result<()>;
+    async fn inspect_result(&mut self) -> Result<Option<Receipt>>;
+    async fn close(&mut self) -> Result<()>;
+}
+#[async_trait]
+pub trait PlatformAdapter: Send + Sync {
+    fn capabilities(&self) -> Capabilities;
+    fn validate_content(&self, _content: &Content) -> Result<()> {
+        Ok(())
+    }
+    fn prepare_timeout(&self, _job: &Job) -> Duration {
+        Duration::from_secs(900)
+    }
+    async fn login(
+        &self,
+        store: &Store,
+        account: &Account,
+        cancel: CancellationToken,
+    ) -> Result<SessionStatus>;
+    async fn prepare(&self, ctx: RunContext) -> Result<Box<dyn Prepared>>;
+}
+struct Control {
+    cancel: CancellationToken,
+    submit: Arc<Notify>,
+}
+#[derive(Clone)]
+pub struct Engine {
+    store: Store,
+    adapters: Arc<HashMap<String, Arc<dyn PlatformAdapter>>>,
+    controls: Arc<Mutex<HashMap<String, Control>>>,
+    semaphore: Arc<Semaphore>,
+}
+impl Engine {
+    pub fn new(store: Store, adapters: Vec<(Platform, Arc<dyn PlatformAdapter>)>) -> Self {
+        Self {
+            store,
+            adapters: Arc::new(
+                adapters
+                    .into_iter()
+                    .map(|(p, a)| (format!("{p:?}"), a))
+                    .collect(),
+            ),
+            controls: Default::default(),
+            semaphore: Arc::new(Semaphore::new(1)),
+        }
+    }
+    pub fn adapter(&self, p: Platform) -> Result<Arc<dyn PlatformAdapter>> {
+        self.adapters
+            .get(&format!("{p:?}"))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("平台尚未接入"))
+    }
+    pub fn cancel_all(&self) {
+        for c in self.controls.lock().unwrap().values() {
+            c.cancel.cancel();
+        }
+    }
+    pub fn active_count(&self) -> usize {
+        self.controls.lock().unwrap().len()
+    }
+    pub fn resume(&self, id: String) -> Result<()> {
+        ensure!(
+            !self.controls.lock().unwrap().contains_key(&id),
+            "任务正在执行"
+        );
+        let job = self.store.job(&id)?;
+        if matches!(job.state, JobState::Failed | JobState::Cancelled) {
+            job.content.validate()?;
+            self.store
+                .transition(&id, JobState::Queued, "用户重新准备；保留之前的执行记录")?;
+        }
+        self.start(id)
+    }
+    pub fn cancel(&self, id: &str) -> Result<()> {
+        if let Some(c) = self.controls.lock().unwrap().get(id) {
+            c.cancel.cancel();
+        } else if self.store.job(id)?.state == JobState::Queued {
+            self.store
+                .transition(id, JobState::Cancelled, "排队任务已取消")?;
+        }
+        Ok(())
+    }
+    pub fn submit(&self, id: &str) -> Result<()> {
+        let j = self.store.job(id)?;
+        ensure!(
+            self.adapter(j.account.platform)?
+                .capabilities()
+                .submit_enabled,
+            "该平台真实提交尚未开放"
+        );
+        ensure!(
+            j.state == JobState::WaitingUser && j.ready_to_submit,
+            "任务尚未准备完成"
+        );
+        self.controls
+            .lock()
+            .unwrap()
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("该任务已停止，请重新准备"))?
+            .submit
+            .notify_one();
+        Ok(())
+    }
+    pub fn start(&self, id: String) -> Result<()> {
+        ensure!(
+            self.store.job(&id)?.state == JobState::Queued,
+            "任务不在队列中"
+        );
+        let cancel = CancellationToken::new();
+        let submit = Arc::new(Notify::new());
+        {
+            let mut controls = self.controls.lock().unwrap();
+            ensure!(!controls.contains_key(&id), "任务已经启动");
+            controls.insert(
+                id.clone(),
+                Control {
+                    cancel: cancel.clone(),
+                    submit: submit.clone(),
+                },
+            );
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _ = engine.run(&id, cancel, submit).await;
+            engine.controls.lock().unwrap().remove(&id);
+        });
+        Ok(())
+    }
+    async fn run(&self, id: &str, cancel: CancellationToken, submit: Arc<Notify>) -> Result<()> {
+        let _permit = tokio::select! { p=self.semaphore.acquire()=>p?, _=cancel.cancelled()=>{self.store.transition(id,JobState::Cancelled,"排队任务已取消")?; return Ok(());} };
+        if self.store.job(id)?.state != JobState::Queued {
+            return Ok(());
+        }
+        let job = self.store.claim(id)?;
+        let result = self.execute(job.clone(), cancel.clone(), submit).await;
+        if let Err(error) = &result {
+            let state = self.store.job(id)?.state;
+            let failure = error
+                .downcast_ref::<UserError>()
+                .map(|e| e.0.as_str())
+                .unwrap_or("准备失败：请检查登录、素材、网络或平台页面变化后重新准备");
+            let (next, msg) = if state == JobState::Submitting {
+                (
+                    JobState::Unknown,
+                    "提交结果无法确认，请在平台核对；不会自动重发",
+                )
+            } else if cancel.is_cancelled() {
+                (JobState::Cancelled, "提交前已停止；平台可能保留上传草稿")
+            } else {
+                (JobState::Failed, failure)
+            };
+            if state.active() {
+                self.store.transition(id, next, msg)?;
+            }
+        }
+        result
+    }
+    async fn execute(
+        &self,
+        job: Job,
+        cancel: CancellationToken,
+        submit: Arc<Notify>,
+    ) -> Result<()> {
+        let adapter = self.adapter(job.account.platform)?;
+        let capabilities = adapter.capabilities();
+        if !capabilities.separate_prepare {
+            return Err(UserError("该平台尚不支持提交前暂停".into()).into());
+        }
+        if job.content.asset.kind == MediaKind::Images && !capabilities.image_posts {
+            return Err(UserError("该平台尚不支持图文发布".into()).into());
+        }
+        job.content
+            .validate()
+            .and_then(|()| job.content.validate_for_platform(job.account.platform))
+            .map_err(|e| UserError(e.to_string()))?;
+        adapter.validate_content(&job.content)?;
+        let _profile = self
+            .store
+            .lease(&job.account.id)
+            .map_err(|_| UserError("该账号正在登录或执行任务，请稍后重新准备".into()))?;
+        let ctx = RunContext {
+            store: self.store.clone(),
+            job: job.clone(),
+            cancel: cancel.clone(),
+        };
+        let prepare_timeout = adapter.prepare_timeout(&job);
+        let mut prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("已取消"),
+            _ = tokio::time::sleep(prepare_timeout) => {
+                return Err(UserError("发布准备已超时。请检查网络后重新准备。".into()).into());
+            }
+            result = adapter.prepare(ctx) => result?,
+        };
+        self.store.prepared(&job.id)?;
+        let proceed = tokio::select! { _=submit.notified()=>true, _=cancel.cancelled()=>false, _=tokio::time::sleep(std::time::Duration::from_secs(1800))=>false };
+        if !proceed {
+            let _ = prepared.close().await;
+            if !cancel.is_cancelled() {
+                return Err(UserError("提交前等待已超时，浏览器已关闭；可重新准备".into()).into());
+            }
+            anyhow::bail!("已停止");
+        }
+        if cancel.is_cancelled() {
+            let _ = prepared.close().await;
+            anyhow::bail!("已取消");
+        }
+        if let Err(e) = job.content.asset.verify() {
+            let _ = prepared.close().await;
+            return Err(UserError(e.to_string()).into());
+        }
+        let preflight = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(UserError("已停止提交".into()).into()),
+            result = prepared.preflight_submission() => result,
+        };
+        if let Err(error) = preflight {
+            let _ = prepared.close().await;
+            return Err(error);
+        }
+        // This transaction must commit before the first platform submission action.
+        self.store.transition(
+            &job.id,
+            JobState::Submitting,
+            "正在提交；中断时将保留结果待确认",
+        )?;
+        let submission_timeout = prepared.submission_timeout();
+        let result = tokio::select! {
+            result = async { prepared.submit().await?; prepared.inspect_result().await } => result,
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("提交后停止等待")),
+            _ = tokio::time::sleep(submission_timeout) => Err(anyhow::anyhow!("提交确认超时")),
+        };
+        let _ = prepared.close().await;
+        match result {
+            Ok(Some(receipt)) => {
+                self.store.received(&job.id, receipt)?;
+            }
+            _ => {
+                self.store.transition(
+                    &job.id,
+                    JobState::Unknown,
+                    "提交结果待确认，请到平台核对；不会自动重发",
+                )?;
+            }
+        }
+        Ok(())
+    }
+}

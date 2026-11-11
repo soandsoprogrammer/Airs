@@ -1,0 +1,4 @@
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS removed_jobs(job_id TEXT PRIMARY KEY REFERENCES jobs(id));
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(3);
+COMMIT;
