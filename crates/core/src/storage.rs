@@ -93,6 +93,7 @@ impl Store {
             Platform::Douyin => "抖音账号",
             Platform::Kuaishou => "快手账号",
             Platform::Xiaohongshu => "小红书账号",
+            Platform::WechatChannels => "视频号账号",
             Platform::Simulation => "模拟测试账号",
         };
         // Removed accounts still count so an existing default name isn't reused.
@@ -114,11 +115,13 @@ impl Store {
             checked_at: None,
             nickname: None,
             alias_customized: customized,
+            note: String::new(),
         };
         self.save_account(&a)?;
         Ok(a)
     }
     pub fn save_account(&self, a: &Account) -> Result<()> {
+        Self::validate_account_note(&a.note)?;
         self.conn()?.execute(
             "INSERT INTO accounts VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             params![a.id, serde_json::to_string(a)?],
@@ -180,6 +183,17 @@ impl Store {
             a.alias = alias.trim().into();
             a.alias_customized = true;
         })
+    }
+    pub fn save_account_note(&self, id: &str, note: &str) -> Result<()> {
+        Self::validate_account_note(note)?;
+        self.update_account(id, |account| account.note = note.to_owned())
+    }
+    fn validate_account_note(note: &str) -> Result<()> {
+        ensure!(
+            note.chars().count() <= ACCOUNT_NOTE_LIMIT,
+            "账号备注最多 {ACCOUNT_NOTE_LIMIT} 字"
+        );
+        Ok(())
     }
     pub fn sync_session(
         &self,
@@ -296,10 +310,12 @@ impl Store {
             if a.platform != Platform::Douyin {
                 content.douyin_video_covers = DouyinVideoCovers::default();
             }
+            let mut account = a.clone();
+            account.note.clear();
             let j = Job {
                 id: uuid::Uuid::new_v4().to_string(),
                 batch_id: batch_id.clone(),
-                account: a.clone(),
+                account,
                 content,
                 state: JobState::Queued,
                 message: "等待准备；最终提交需要单独操作".into(),
@@ -447,6 +463,9 @@ impl Store {
                 && match job.account.platform {
                     Platform::Kuaishou => true,
                     Platform::Xiaohongshu => receipt.evidence == XIAOHONGSHU_ACCEPTED_EVIDENCE,
+                    Platform::WechatChannels => {
+                        receipt.evidence == WECHAT_CHANNELS_ACCEPTED_EVIDENCE
+                    }
                     _ => false,
                 };
             ensure!(

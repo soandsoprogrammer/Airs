@@ -1,14 +1,20 @@
 use gpui_kit::{assets::IconName, component::*, prelude::FluentBuilder, *};
 use publisher_core::{JobState, Platform};
 use publisher_platforms::upload_progress::UploadProgress;
+use std::sync::{Arc, OnceLock};
 
-pub const CANVAS: u32 = 0xf6f7fb;
+pub const CANVAS: u32 = 0xf0f3f9;
 pub const SURFACE: u32 = 0xffffff;
-pub const BORDER: u32 = 0xe4e8f0;
-pub const INK: u32 = 0x182237;
-pub const MUTED: u32 = 0x65718a;
-pub const ACCENT: u32 = 0x5146d9;
-pub const ACCENT_WASH: u32 = 0xefedff;
+pub const BORDER: u32 = 0xdfe5f0;
+pub const INK: u32 = 0x17233b;
+pub const MUTED: u32 = 0x5e6c84;
+pub const ACCENT: u32 = 0x484fcb;
+pub const ACCENT_WASH: u32 = 0xebedff;
+pub const NAV_SURFACE: u32 = 0x172238;
+pub const NAV_HOVER: u32 = 0x222f49;
+pub const NAV_SELECTED: u32 = 0x303e65;
+pub const NAV_INK: u32 = 0xe0e6f4;
+pub const NAV_ACCENT: u32 = 0xa6afff;
 
 pub fn install_theme(cx: &mut App) {
     Theme::change(ThemeMode::Light, None, cx);
@@ -29,8 +35,8 @@ pub fn install_theme(cx: &mut App) {
         colors.accent_foreground = rgb(ACCENT).into();
         colors.selection = rgb(0xe0dbff).into();
         colors.primary = rgb(ACCENT).into();
-        colors.primary_hover = rgb(0x463bc8).into();
-        colors.primary_active = rgb(0x3c31b5).into();
+        colors.primary_hover = rgb(0x3d44ba).into();
+        colors.primary_active = rgb(0x343ba9).into();
         colors.primary_foreground = rgb(SURFACE).into();
         colors.button_primary = colors.primary;
         colors.button_primary_hover = colors.primary_hover;
@@ -48,7 +54,7 @@ pub fn surface() -> Div {
         .min_w_0()
         .gap_4()
         .p_5()
-        .rounded(px(16.))
+        .rounded(px(14.))
         .border_1()
         .border_color(rgb(BORDER))
         .bg(rgb(SURFACE))
@@ -72,6 +78,29 @@ pub fn icon_tile(name: IconName, size: f32, ink: u32, background: u32) -> Div {
         .rounded(px(10.))
         .bg(rgb(background))
         .child(glyph(name, size * 0.48, ink))
+}
+
+pub fn platform_brand_icon(platform: Platform, size: f32) -> Div {
+    static DOUYIN: OnceLock<Arc<Image>> = OnceLock::new();
+    static KUAISHOU: OnceLock<Arc<Image>> = OnceLock::new();
+    static XIAOHONGSHU: OnceLock<Arc<Image>> = OnceLock::new();
+    static WECHAT_CHANNELS: OnceLock<Arc<Image>> = OnceLock::new();
+    // App Store artwork and the official WeChat Channels favicon.
+    let (cache, bytes): (_, &[u8]) = match platform {
+        Platform::Douyin => (&DOUYIN, include_bytes!("../assets/Douyin.png")),
+        Platform::Kuaishou => (&KUAISHOU, include_bytes!("../assets/Kuaishou.png")),
+        Platform::Xiaohongshu => (&XIAOHONGSHU, include_bytes!("../assets/Xiaohongshu.png")),
+        Platform::WechatChannels => (
+            &WECHAT_CHANNELS,
+            include_bytes!("../assets/WechatChannels.png"),
+        ),
+        Platform::Simulation => return icon_tile(IconName::Users, size, MUTED, CANVAS),
+    };
+    let image = cache.get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec())));
+    div()
+        .size(px(size))
+        .flex_shrink_0()
+        .child(img(image.clone()).size_full().rounded(px(size * 0.22)))
 }
 
 pub fn state_pill(state: JobState) -> Div {

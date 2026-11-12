@@ -23,12 +23,17 @@ use publisher_core::Platform;
 use publisher_core::*;
 use publisher_platforms::douyin::{CREATOR_MANAGE_URL, UPLOAD_URL as DOUYIN_UPLOAD_URL};
 use publisher_platforms::kuaishou::CREATOR_MANAGE_URL as KUAISHOU_MANAGE_URL;
-use publisher_platforms::sign_in::{SignInPreview, SignInStatus, VerificationAction};
+use publisher_platforms::sign_in::{
+    PublishSmsPreview, SignInPreview, SignInStatus, VerificationAction, WechatChannelChoice,
+    WechatChannelsPreview,
+};
 use publisher_platforms::upload_progress::UploadProgress;
+use publisher_platforms::wechat_channels::CREATOR_MANAGE_URL as WECHAT_CHANNELS_MANAGE_URL;
 use publisher_platforms::xiaohongshu::CREATOR_MANAGE_URL as XIAOHONGSHU_MANAGE_URL;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    ops::Range,
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -37,13 +42,21 @@ use video_preview::VideoPreview;
 gpui_kit::actions!(publisher, [Quit]);
 
 const PRODUCT_NAME: &str = "Airs";
-const SIDEBAR_WIDTH: f32 = 206.;
+const SIDEBAR_WIDTH: f32 = 184.;
 const WORKSPACE_MAX_WIDTH: f32 = 1240.;
-const WORKSPACE_PADDING: f32 = 28.;
+const WORKSPACE_PADDING: f32 = 24.;
 
 fn workspace_content_width(window: &Window) -> f32 {
     (window.viewport_size().width.as_f32() - SIDEBAR_WIDTH).min(WORKSPACE_MAX_WIDTH)
         - WORKSPACE_PADDING * 2.
+}
+
+fn workspace_frame() -> Div {
+    v_flex()
+        .w_full()
+        .max_w(px(WORKSPACE_MAX_WIDTH))
+        .mx_auto()
+        .px(px(WORKSPACE_PADDING))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,7 +98,7 @@ struct Publisher {
     sign_in_images: HashMap<String, Arc<Image>>,
     verification_images: HashMap<String, VerificationImage>,
     verification_inputs: HashMap<String, (Entity<InputState>, Subscription)>,
-    publish_sms_input: Option<PublishSmsInput>,
+    publish_sms_inputs: HashMap<u64, PublishSmsInput>,
     page: Page,
     message: String,
     alias: Entity<InputState>,
@@ -109,10 +122,17 @@ struct Publisher {
     browser_loaded: bool,
     account_filter: Option<Platform>,
     account_details: Option<AccountDetails>,
+    job_account_filter: Option<AccountJobFilter>,
     confirming_publish: Option<String>,
     confirming_not_published: Option<String>,
     confirming_delete_job: Option<String>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct AccountJobFilter {
+    id: String,
+    alias: String,
+    platform: Platform,
 }
 
 struct PreviewCheck {
@@ -139,7 +159,6 @@ struct DisplayedVerificationImage {
 }
 
 struct PublishSmsInput {
-    verification_id: u64,
     input: Entity<InputState>,
     valid: bool,
     _subscription: Subscription,
@@ -150,11 +169,27 @@ fn valid_sms_code(value: &str) -> bool {
     (4..=8).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn publish_sms_challenge(
+    snapshot: &Snapshot,
+    job: &Job,
+) -> Option<(u64, PublishSmsPreview, Option<&'static str>)> {
+    if job.state != JobState::Submitting || job.account.platform != Platform::Douyin {
+        return None;
+    }
+    let preview = snapshot.sign_ins.get(&job.account.id)?;
+    Some((
+        preview.verification_id?,
+        preview.publish_sms?,
+        preview.input_feedback,
+    ))
+}
+
 fn creator_content_management(platform: Platform) -> Option<&'static str> {
     match platform {
         Platform::Douyin => Some(CREATOR_MANAGE_URL),
         Platform::Kuaishou => Some(KUAISHOU_MANAGE_URL),
         Platform::Xiaohongshu => Some(XIAOHONGSHU_MANAGE_URL),
+        Platform::WechatChannels => Some(WECHAT_CHANNELS_MANAGE_URL),
         Platform::Simulation => None,
     }
 }
@@ -225,7 +260,7 @@ impl Publisher {
             sign_in_images: HashMap::new(),
             verification_images: HashMap::new(),
             verification_inputs: HashMap::new(),
-            publish_sms_input: None,
+            publish_sms_inputs: HashMap::new(),
             page: Page::Overview,
             message: String::new(),
             alias: input("修改此账号的显示名称", cx),
@@ -249,6 +284,7 @@ impl Publisher {
             browser_loaded: false,
             account_filter: None,
             account_details: None,
+            job_account_filter: None,
             confirming_publish: None,
             confirming_not_published: None,
             confirming_delete_job: None,
@@ -267,6 +303,34 @@ impl Publisher {
         );
         view
     }
+
+    fn navigate(&mut self, page: Page) {
+        if page != Page::Jobs || self.page != Page::Jobs || self.job_account_filter.is_some() {
+            self.confirming_publish = None;
+            self.confirming_not_published = None;
+            self.confirming_delete_job = None;
+        }
+        self.page = page;
+        self.photo_preview = None;
+        self.account_details = None;
+        self.job_account_filter = None;
+    }
+
+    fn open_account_jobs(&mut self, account: &Account) {
+        self.navigate(Page::Jobs);
+        self.job_account_filter = Some(AccountJobFilter {
+            id: account.id.clone(),
+            alias: account.alias.clone(),
+            platform: account.platform,
+        });
+    }
+
+    fn job_in_scope(&self, job: &Job) -> bool {
+        self.job_account_filter
+            .as_ref()
+            .is_none_or(|account| job.account.id == account.id)
+    }
+
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
         let previous = &self.snapshot.sign_ins;
         self.sign_in_images.retain(|id, image| {
@@ -304,6 +368,11 @@ impl Publisher {
         });
         self.verification_inputs
             .retain(|id, _| same_frame_verification(id));
+        self.publish_sms_inputs.retain(|verification_id, _| {
+            snapshot.sign_ins.values().any(|preview| {
+                preview.publish_sms.is_some() && preview.verification_id == Some(*verification_id)
+            })
+        });
         for (id, preview) in &snapshot.sign_ins {
             if let Some(png) = &preview.png {
                 self.sign_in_images.entry(id.clone()).or_insert_with(|| {
@@ -423,7 +492,107 @@ impl Publisher {
             .iter()
             .find(|account| account.id == account_id)?
             .platform;
+        let mut panel = h_flex()
+            .items_center()
+            .flex_wrap()
+            .gap_5()
+            .p_4()
+            .rounded_xl()
+            .border_1()
+            .border_color(rgb(0xe2defb))
+            .bg(rgb(0xf7f6ff));
+        if platform == Platform::WechatChannels
+            && let (Some(mode), Some(verification_id)) =
+                (&preview.wechat_channels, preview.verification_id)
+        {
+            let (title, detail, scan_label) = match mode {
+                WechatChannelsPreview::Choice { nickname } => (
+                    "登录视频号",
+                    Some(format!("使用电脑上的微信「{nickname}」确认登录。")),
+                    "使用微信扫码",
+                ),
+                WechatChannelsPreview::WaitingForDesktop => {
+                    ("正在等待桌面微信确认", None, "改用扫码")
+                }
+                WechatChannelsPreview::SelectChannel { channels } => {
+                    let picker = self.wechat_channel_picker(
+                        account_id,
+                        panel_id,
+                        verification_id,
+                        channels,
+                        cx,
+                    );
+                    return Some(
+                        panel
+                            .child(
+                                picker.when_some(preview.input_feedback, |picker, feedback| {
+                                    picker.child(
+                                        div().text_sm().text_color(rgb(MUTED)).child(feedback),
+                                    )
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            };
+            let scan_account = account_id.to_owned();
+            let actions = h_flex()
+                .flex_wrap()
+                .gap_2()
+                .when(
+                    matches!(mode, WechatChannelsPreview::Choice { .. }),
+                    |row| {
+                        let quick_account = account_id.to_owned();
+                        row.child(
+                            Button::new(eid("wechat-quick-login", panel_id))
+                                .primary()
+                                .label("微信快捷登录")
+                                .on_click(cx.listener(move |s, _, _, _| {
+                                    s.backend.send(Command::VerificationInput(
+                                        quick_account.clone(),
+                                        verification_id,
+                                        VerificationAction::WechatQuickLogin,
+                                    ));
+                                })),
+                        )
+                    },
+                )
+                .child(
+                    Button::new(eid("wechat-scan-login", panel_id))
+                        .label(scan_label)
+                        .on_click(cx.listener(move |s, _, _, _| {
+                            s.backend.send(Command::VerificationInput(
+                                scan_account.clone(),
+                                verification_id,
+                                VerificationAction::WechatScanLogin,
+                            ));
+                        })),
+                );
+            return Some(
+                panel
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                            .when_some(detail, |info, detail| {
+                                info.child(div().text_sm().text_color(rgb(0x635c78)).child(detail))
+                            })
+                            .child(actions)
+                            .when_some(preview.input_feedback, |info, feedback| {
+                                info.child(
+                                    div().text_sm().text_color(rgb(0x635c78)).child(feedback),
+                                )
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
         let name = platform.name();
+        let login_app = if platform == Platform::WechatChannels {
+            "微信"
+        } else {
+            name
+        };
         let (title, detail, refresh_label): (_, SharedString, _) = match preview.status {
             SignInStatus::Loading if platform == Platform::Xiaohongshu => (
                 "正在打开小红书登录页",
@@ -437,12 +606,15 @@ impl Publisher {
             ),
             SignInStatus::WaitingForScan => (
                 "扫码登录",
-                format!("打开{name} App 扫码，按手机上的提示完成登录。").into(),
+                format!("打开{login_app} App 扫码，按手机上的提示完成登录。").into(),
                 Some("刷新二维码"),
             ),
+            SignInStatus::ConfirmOnPhone if platform == Platform::WechatChannels => {
+                ("等待微信确认", "请按微信中的提示确认登录。".into(), None)
+            }
             SignInStatus::ConfirmOnPhone => (
                 "已扫码，等待手机确认",
-                format!("请在{name} App 确认这次登录。").into(),
+                format!("请在{login_app} App 确认这次登录。").into(),
                 None,
             ),
             SignInStatus::Expired => (
@@ -459,15 +631,6 @@ impl Publisher {
                 None,
             ),
         };
-        let mut panel = h_flex()
-            .items_center()
-            .flex_wrap()
-            .gap_5()
-            .p_4()
-            .rounded_xl()
-            .border_1()
-            .border_color(rgb(0xe2defb))
-            .bg(rgb(0xf7f6ff));
         if preview.status == SignInStatus::WaitingForScan
             && let Some(image) = self.sign_in_images.get(account_id)
         {
@@ -503,6 +666,95 @@ impl Publisher {
         Some(panel.child(info).into_any_element())
     }
 
+    fn wechat_channel_picker(
+        &self,
+        account_id: &str,
+        panel_id: &str,
+        verification_id: u64,
+        channels: &[WechatChannelChoice],
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let picker_id = format!("{panel_id}-{verification_id}");
+        let choices = channels.iter().enumerate().map(|(index, channel)| {
+            let label = if channel.role.is_empty() {
+                channel.nickname.clone()
+            } else {
+                format!("{}，{}", channel.nickname, channel.role)
+            };
+            Button::new(eid(
+                "wechat-select-channel",
+                &format!("{picker_id}-{index}"),
+            ))
+            .h(px(44.))
+            .w_full()
+            .disabled(!channel.available)
+            .accessibility_label(label)
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_left()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(channel.nickname.clone()),
+                    )
+                    .when(!channel.role.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(channel.role.clone()),
+                        )
+                    })
+                    .when(!channel.available, |row| {
+                        row.child(div().text_xs().text_color(rgb(MUTED)).child("不可用"))
+                    }),
+            )
+            .when(channel.available, |button| {
+                let account_id = account_id.to_owned();
+                button.on_click(cx.listener(move |s, _, _, _| {
+                    s.backend.send(Command::VerificationInput(
+                        account_id.clone(),
+                        verification_id,
+                        VerificationAction::WechatSelectChannel { index },
+                    ));
+                }))
+            })
+        });
+        v_flex()
+            .w_full()
+            .max_w(px(540.))
+            .gap_2()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("选择要登录的视频号"),
+            )
+            .child(
+                v_flex()
+                    .id(eid("wechat-channel-options", &picker_id))
+                    .gap_2()
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
+                    .children(choices),
+            )
+            .when(
+                !channels.iter().any(|channel| channel.available),
+                |picker| {
+                    picker.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("没有可选的视频号。"),
+                    )
+                },
+            )
+    }
+
     fn verification_panel(
         &self,
         account_id: &str,
@@ -526,6 +778,7 @@ impl Publisher {
                     .child(match platform {
                         Platform::Kuaishou => "选择快手登录角色",
                         Platform::Xiaohongshu => "小红书短信登录",
+                        Platform::WechatChannels => "完成视频号登录验证",
                         _ => "完成抖音安全验证",
                     }),
             );
@@ -669,54 +922,35 @@ impl Publisher {
         }
     }
 
-    fn publish_sms_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
-        let challenge = self.snapshot.jobs.iter().find_map(|job| {
-            if job.state != JobState::Submitting || job.account.platform != Platform::Douyin {
-                return None;
-            }
-            let preview = self.snapshot.sign_ins.get(&job.account.id)?;
-            Some((
-                job,
-                preview.publish_sms.as_ref()?,
-                preview.verification_id?,
-                preview.input_feedback,
-            ))
-        });
-        let Some((job, sms, verification_id, feedback)) = challenge else {
-            self.publish_sms_input = None;
-            return None;
-        };
-
-        if self
-            .publish_sms_input
-            .as_ref()
-            .is_none_or(|field| field.verification_id != verification_id)
-        {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("短信验证码")
-                    .masked(true)
-            });
-            let subscription = cx.subscribe(&input, |view, input, event, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Some(field) = view.publish_sms_input.as_mut()
-                    && field.input == input
-                {
-                    let valid = valid_sms_code(&input.read(cx).value());
-                    if field.valid != valid {
-                        field.valid = valid;
-                        cx.notify();
+    fn publish_sms_panel(
+        &mut self,
+        job: &Job,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        let (verification_id, sms, feedback) = publish_sms_challenge(&self.snapshot, job)?;
+        let field = self
+            .publish_sms_inputs
+            .entry(verification_id)
+            .or_insert_with(|| {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("短信验证码"));
+                let subscription = cx.subscribe(&input, move |view, input, event, cx| {
+                    if matches!(event, InputEvent::Change)
+                        && let Some(field) = view.publish_sms_inputs.get_mut(&verification_id)
+                    {
+                        let valid = valid_sms_code(&input.read(cx).value());
+                        if field.valid != valid {
+                            field.valid = valid;
+                            cx.notify();
+                        }
                     }
+                });
+                PublishSmsInput {
+                    input,
+                    valid: false,
+                    _subscription: subscription,
                 }
             });
-            self.publish_sms_input = Some(PublishSmsInput {
-                verification_id,
-                input,
-                valid: false,
-                _subscription: subscription,
-            });
-        }
-        let field = self.publish_sms_input.as_ref()?;
         let input = field.input.clone();
         let request_account = job.account.id.clone();
         let verify_account = job.account.id.clone();
@@ -730,8 +964,6 @@ impl Publisher {
             h_flex()
                 .items_start()
                 .gap_3()
-                .mx_7()
-                .mt_4()
                 .p_4()
                 .flex_shrink_0()
                 .rounded_xl()
@@ -762,7 +994,7 @@ impl Publisher {
                                 .w_full()
                                 .gap_2()
                                 .child(
-                                    Button::new("publish-sms-request")
+                                    Button::new(eid("publish-sms-request", &job.id))
                                         .label(request_label)
                                         .disabled(!sms.can_request_code)
                                         .on_click(cx.listener(move |s, _, _, _| {
@@ -777,11 +1009,11 @@ impl Publisher {
                                     div().min_w_0().flex_1().child(
                                         Input::new(&input)
                                             .content_type(InputContentType::OneTimeCode)
-                                            .role(Role::PasswordInput),
+                                            .aria_label("短信验证码"),
                                     ),
                                 )
                                 .child(
-                                    Button::new("publish-sms-verify")
+                                    Button::new(eid("publish-sms-verify", &job.id))
                                         .primary()
                                         .label("验证")
                                         .disabled(!sms.can_verify || !field.valid)
@@ -798,8 +1030,8 @@ impl Publisher {
                                                 verify_input.update(cx, |input, cx| {
                                                     input.set_value("", window, cx);
                                                 });
-                                                if let Some(field) = s.publish_sms_input.as_mut()
-                                                    && field.verification_id == verification_id
+                                                if let Some(field) =
+                                                    s.publish_sms_inputs.get_mut(&verification_id)
                                                 {
                                                     field.valid = false;
                                                     cx.notify();
@@ -813,6 +1045,43 @@ impl Publisher {
                         }),
                 ),
         )
+    }
+
+    fn publish_sms_notice(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let pending = self
+            .snapshot
+            .jobs
+            .iter()
+            .filter(|job| self.page != Page::Jobs || !self.job_in_scope(job))
+            .filter(|job| publish_sms_challenge(&self.snapshot, job).is_some())
+            .count();
+        (pending > 0).then(|| {
+            h_flex()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(ACCENT_WASH))
+                .child(glyph(AppIcon::ShieldCheck, 18., ACCENT))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .child(format!("{pending} 个抖音任务需要短信验证")),
+                )
+                .child(
+                    Button::new("open-publish-sms-jobs")
+                        .small()
+                        .label("查看任务")
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.navigate(Page::Jobs);
+                            cx.notify();
+                        })),
+                )
+        })
     }
 
     fn pick_media(&mut self, kind: MediaKind, cx: &mut Context<Self>) {
@@ -1010,7 +1279,8 @@ impl Publisher {
         )
     }
 
-    fn overview(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn overview(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let wide = workspace_content_width(window) >= 760.;
         let publishing_accounts = self.snapshot.accounts.iter().filter(|account| {
             self.snapshot
                 .can_prepare(account.platform, MediaKind::Video)
@@ -1020,13 +1290,18 @@ impl Publisher {
             .filter(|account| account.session == SessionStatus::Ready)
             .count();
         let asset_count = self.snapshot.assets.len();
-        let needs_attention = |job: &&Job| {
+        let needs_attention = |job: &Job| {
             matches!(
                 job.state,
                 JobState::WaitingUser | JobState::Unknown | JobState::Failed
             )
         };
-        let attention_count = self.snapshot.jobs.iter().filter(needs_attention).count();
+        let attention_count = self
+            .snapshot
+            .jobs
+            .iter()
+            .filter(|job| needs_attention(job))
+            .count();
         let active_count = self
             .snapshot
             .jobs
@@ -1068,97 +1343,106 @@ impl Publisher {
                 Page::Compose,
             )
         };
-        let next_step = surface()
+        let next_style = ButtonCustomVariant::new(cx)
+            .color(rgb(SURFACE).into())
+            .foreground(rgb(0x27345d).into())
+            .hover(rgb(0xe9edff).into())
+            .active(rgb(0xdbe1ff).into());
+        let next_step = v_flex()
+            .min_w_0()
+            .justify_center()
+            .gap_3()
             .p_6()
-            .bg(rgb(0xf0eeff))
-            .border_color(rgb(0xe1dcfa))
+            .rounded(px(14.))
+            .bg(linear_gradient(
+                112.,
+                linear_color_stop(rgb(0x202c52), 0.),
+                linear_color_stop(rgb(0x414897), 1.),
+            ))
+            .text_color(rgb(SURFACE))
+            .child(icon_tile(icon, 36., NAV_ACCENT, 0x35436d))
             .child(
-                h_flex()
-                    .items_start()
-                    .gap_4()
-                    .child(icon_tile(icon, 44., ACCENT, SURFACE))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .flex_1()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(heading),
-                            )
-                            .child(div().text_sm().text_color(rgb(MUTED)).child(detail))
-                            .child(
-                                h_flex().gap_2().mt_1().flex_wrap().child(
-                                    Button::new("overview-next")
-                                        .primary()
-                                        .label(action)
-                                        .icon(AppIcon::ArrowRight)
-                                        .on_click(cx.listener(move |s, _, _, cx| {
-                                            s.page = destination;
-                                            cx.notify();
-                                        })),
-                                ),
-                            ),
-                    ),
-            );
-        let metric = |label: &'static str, value: String, icon, ink, background| {
-            surface().flex_1().gap_3().child(
-                h_flex()
-                    .items_start()
-                    .gap_3()
-                    .child(icon_tile(icon, 34., ink, background))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_1()
-                            .child(div().text_sm().text_color(rgb(MUTED)).child(label))
-                            .child(
-                                div()
-                                    .text_size(px(24.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(value),
-                            ),
-                    ),
+                div()
+                    .text_size(px(25.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(heading),
             )
-        };
-        let mut activity = surface().gap_3().child(
-            h_flex()
-                .justify_between()
-                .gap_3()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("任务动态"),
-                        )
-                        .when(attention_count > 0, |heading| {
-                            heading.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8b4f10))
-                                    .child(format!("{attention_count} 项任务待处理")),
-                            )
-                        }),
-                )
-                .child(
-                    Button::new("overview-jobs")
-                        .ghost()
-                        .small()
-                        .label("查看任务")
+            .child(div().text_sm().text_color(rgb(0xe0e5ff)).child(detail))
+            .child(
+                h_flex().mt_1().child(
+                    Button::new("overview-next")
+                        .custom(next_style)
+                        .bg(rgb(SURFACE))
+                        .label(action)
                         .icon(AppIcon::ArrowRight)
-                        .on_click(cx.listener(|s, _, _, cx| {
-                            s.page = Page::Jobs;
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.page = destination;
                             cx.notify();
                         })),
                 ),
-        );
-        if self.snapshot.jobs.is_empty() {
-            activity = activity.child(
+            );
+        let metric = |label: &'static str, value: String, icon, ink, background| {
+            h_flex()
+                .min_w_0()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(rgb(CANVAS))
+                .when(!wide, |row| row.flex_1())
+                .child(icon_tile(icon, 32., ink, background))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(value),
+                )
+        };
+        let activity_header = h_flex()
+            .flex_shrink_0()
+            .justify_between()
+            .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("任务动态"),
+                    )
+                    .when(attention_count > 0, |heading| {
+                        heading.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x8b4f10))
+                                .child(format!("{attention_count} 项任务待处理")),
+                        )
+                    }),
+            )
+            .child(
+                Button::new("overview-jobs")
+                    .ghost()
+                    .small()
+                    .label("查看任务")
+                    .icon(AppIcon::ArrowRight)
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.navigate(Page::Jobs);
+                        cx.notify();
+                    })),
+            );
+        let activity = surface().flex_1().min_h_0().gap_3().child(activity_header);
+        let activity = if self.snapshot.jobs.is_empty() {
+            activity.child(
                 h_flex()
                     .gap_3()
                     .p_3()
@@ -1176,95 +1460,110 @@ impl Publisher {
                                     .child("准备任务的进度和平台结果会显示在这里。"),
                             ),
                     ),
-            );
+            )
         } else {
-            for job in self
-                .snapshot
-                .jobs
-                .iter()
-                .filter(needs_attention)
-                .chain(
-                    self.snapshot
-                        .jobs
-                        .iter()
-                        .filter(|job| !needs_attention(job)),
+            let (mut attention, others): (Vec<_>, Vec<_>) = (0..self.snapshot.jobs.len())
+                .partition(|&index| needs_attention(&self.snapshot.jobs[index]));
+            attention.extend(others);
+            activity.child(
+                uniform_list(
+                    "overview-activity",
+                    attention.len(),
+                    cx.processor(move |view, range: Range<usize>, _, _| {
+                        range
+                            .map(|index| {
+                                let job = &view.snapshot.jobs[attention[index]];
+                                h_flex()
+                                    .w_full()
+                                    .h(px(64.))
+                                    .justify_between()
+                                    .gap_4()
+                                    .border_t_1()
+                                    .border_color(rgb(BORDER))
+                                    .child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .gap_3()
+                                            .child(icon_tile(
+                                                media_icon(job.content.asset.kind),
+                                                36.,
+                                                ACCENT,
+                                                ACCENT_WASH,
+                                            ))
+                                            .child(
+                                                v_flex()
+                                                    .min_w_0()
+                                                    .flex_1()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .truncate()
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .child(job.content.title.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .truncate()
+                                                            .text_xs()
+                                                            .text_color(rgb(MUTED))
+                                                            .child(format!(
+                                                                "{} · {}",
+                                                                job.account.platform.name(),
+                                                                job.account.alias
+                                                            )),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(state_pill(job.state))
+                            })
+                            .collect::<Vec<_>>()
+                    }),
                 )
-                .take(4)
-            {
-                activity = activity.child(
-                    h_flex()
-                        .justify_between()
-                        .gap_4()
-                        .border_t_1()
-                        .border_color(rgb(BORDER))
-                        .pt_3()
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_3()
-                                .child(icon_tile(
-                                    media_icon(job.content.asset.kind),
-                                    36.,
-                                    ACCENT,
-                                    ACCENT_WASH,
-                                ))
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(job.content.title.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(rgb(MUTED))
-                                                .child(format!(
-                                                    "{} · {}",
-                                                    job.account.platform.name(),
-                                                    job.account.alias
-                                                )),
-                                        ),
-                                ),
-                        )
-                        .child(state_pill(job.state)),
-                );
-            }
-        }
+                .w_full()
+                .flex_1()
+                .min_h_0(),
+            )
+        };
+        let metrics = surface()
+            .justify_center()
+            .gap_2()
+            .p_3()
+            .when(wide, |panel| panel.w(px(306.)).flex_shrink_0())
+            .when(!wide, |panel| panel.flex_row().items_stretch())
+            .child(metric(
+                "已验证账号",
+                format!("{verified_accounts} / {publishing_account_count}"),
+                AppIcon::Users,
+                ACCENT,
+                ACCENT_WASH,
+            ))
+            .child(metric(
+                "本地素材",
+                asset_count.to_string(),
+                AppIcon::FolderOpen,
+                0x16775c,
+                0xe8f7ef,
+            ))
+            .child(metric(
+                "进行中任务",
+                active_count.to_string(),
+                AppIcon::ListChecks,
+                0x985812,
+                0xfff1de,
+            ));
         v_flex()
+            .flex_1()
+            .min_h_0()
             .gap_4()
-            .child(next_step)
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .items_stretch()
-                    .gap_3()
-                    .child(metric(
-                        "已验证 / 发布账号",
-                        format!("{verified_accounts} / {publishing_account_count}"),
-                        AppIcon::Users,
-                        ACCENT,
-                        ACCENT_WASH,
-                    ))
-                    .child(metric(
-                        "本地素材",
-                        asset_count.to_string(),
-                        AppIcon::FolderOpen,
-                        0x16775c,
-                        0xe8f7ef,
-                    ))
-                    .child(metric(
-                        "进行中任务",
-                        active_count.to_string(),
-                        AppIcon::ListChecks,
-                        0x985812,
-                        0xfff1de,
-                    )),
+                    .gap_4()
+                    .when(!wide, |row| row.flex_col())
+                    .child(next_step.when(wide, |panel| panel.flex_1()))
+                    .child(metrics),
             )
             .child(activity)
             .into_any_element()
@@ -1285,7 +1584,10 @@ impl Publisher {
                     .iter()
                     .find(|account| account.id == *id)
                     .map(|account| account.platform);
-                if preview.publish_sms.is_some() || platform == Some(Platform::Kuaishou) {
+                if preview.publish_sms.is_some()
+                    || preview.wechat_channels.is_some()
+                    || platform == Some(Platform::Kuaishou)
+                {
                     continue;
                 }
                 let Some(verification_id) = preview.verification_id else {
@@ -1295,13 +1597,13 @@ impl Publisher {
                     .entry(id.clone())
                     .or_insert_with(|| {
                         let input = cx.new(|cx| {
-                            InputState::new(window, cx)
-                                .placeholder(if platform == Some(Platform::Xiaohongshu) {
+                            InputState::new(window, cx).placeholder(
+                                if platform == Some(Platform::Xiaohongshu) {
                                     "手机号或短信验证码"
                                 } else {
                                     "验证码或网页要求的文字"
-                                })
-                                .masked(true)
+                                },
+                            )
                         });
                         let account = id.clone();
                         let subscription = cx.subscribe(&input, move |s, input, event, cx| {
@@ -1313,90 +1615,81 @@ impl Publisher {
                     });
             }
         }
-        let panel = surface;
         match self.page {
-            Page::Overview => self.overview(cx),
+            Page::Overview => self.overview(window, cx),
             Page::Accounts => self.accounts(window, cx),
             Page::Assets => {
-                let mut library =
-                    panel().gap_0().child(
+                let toolbar = surface().p_4().child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_4()
+                        .justify_between()
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .child(icon_tile(AppIcon::FolderOpen, 38., ACCENT, ACCENT_WASH))
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                                            format!("{} 组素材", self.snapshot.assets.len()),
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(MUTED))
+                                                .child("文件保留在原位置，执行前会检查变化。"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("import-video")
+                                        .primary()
+                                        .icon(media_icon(MediaKind::Video))
+                                        .label("导入视频")
+                                        .on_click(cx.listener(|s, _, _, cx| {
+                                            s.pick_media(MediaKind::Video, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("import-photos")
+                                        .icon(media_icon(MediaKind::Images))
+                                        .label("导入图片")
+                                        .on_click(cx.listener(|s, _, _, cx| {
+                                            s.pick_media(MediaKind::Images, cx)
+                                        })),
+                                ),
+                        ),
+                );
+                let mut library = surface().gap_0().p_0();
+                if self.snapshot.assets.is_empty() {
+                    library = library.child(
                         h_flex()
-                            .flex_wrap()
-                            .gap_4()
-                            .justify_between()
-                            .pb_4()
+                            .gap_3()
+                            .p_5()
+                            .child(icon_tile(AppIcon::Clapperboard, 40., MUTED, CANVAS))
                             .child(
                                 v_flex()
-                                    .min_w_0()
                                     .gap_1()
-                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                                        "本地素材 · {} 组",
-                                        self.snapshot.assets.len()
-                                    )))
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("还没有导入素材"),
+                                    )
                                     .child(
                                         div()
                                             .text_sm()
-                                            .text_color(rgb(0x65718a))
-                                            .child("文件保留在原位置，执行前会检查变化。"),
+                                            .text_color(rgb(MUTED))
+                                            .child("支持常见视频格式与 JPG、PNG、WebP 图片。"),
                                     ),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("import-video")
-                                            .icon(AppIcon::Plus)
-                                            .label("导入视频")
-                                            .on_click(cx.listener(|s, _, _, cx| {
-                                                s.pick_media(MediaKind::Video, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("import-photos")
-                                            .primary()
-                                            .icon(AppIcon::Plus)
-                                            .label("导入图片")
-                                            .on_click(cx.listener(|s, _, _, cx| {
-                                                s.pick_media(MediaKind::Images, cx)
-                                            })),
-                                    ),
-                            ),
-                    );
-                if self.snapshot.assets.is_empty() {
-                    library = library.child(
-                        v_flex()
-                            .items_center()
-                            .gap_2()
-                            .py_10()
-                            .px_5()
-                            .rounded_lg()
-                            .bg(rgb(0xf7f8fc))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(44.))
-                                    .mb_1()
-                                    .rounded_lg()
-                                    .bg(rgb(0xeeecff))
-                                    .text_color(rgb(0x5146d9))
-                                    .child(Icon::new(AppIcon::Clapperboard)),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("还没有导入素材"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x65718a))
-                                    .child("支持常见视频格式与 JPG、PNG、WebP 图片。"),
                             ),
                     );
                 }
-                for a in self.snapshot.assets.clone() {
+                for (index, a) in self.snapshot.assets.clone().into_iter().enumerate() {
                     let id = a.id.clone();
                     let name = asset_name(&a);
                     let path = a.path.to_string_lossy().into_owned();
@@ -1404,21 +1697,10 @@ impl Publisher {
                     library = library.child(
                         h_flex()
                             .gap_3()
+                            .px_4()
                             .py_3()
-                            .border_t_1()
-                            .border_color(rgb(0xecedf3))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(38.))
-                                    .flex_shrink_0()
-                                    .rounded_lg()
-                                    .bg(rgb(0xeeecff))
-                                    .text_color(rgb(0x5146d9))
-                                    .child(Icon::new(media_icon(a.kind))),
-                            )
+                            .when(index > 0, |row| row.border_t_1().border_color(rgb(BORDER)))
+                            .child(icon_tile(media_icon(a.kind), 38., ACCENT, ACCENT_WASH))
                             .child(
                                 v_flex()
                                     .min_w_0()
@@ -1434,7 +1716,7 @@ impl Publisher {
                                         div()
                                             .truncate()
                                             .text_sm()
-                                            .text_color(rgb(0x65718a))
+                                            .text_color(rgb(MUTED))
                                             .child(path.clone()),
                                     ),
                             )
@@ -1443,9 +1725,9 @@ impl Publisher {
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(rgb(0xf2f3f8))
+                                    .bg(rgb(CANVAS))
                                     .text_xs()
-                                    .text_color(rgb(0x65718a))
+                                    .text_color(rgb(MUTED))
                                     .flex_shrink_0()
                                     .child(format!(
                                         "{format} · {:.1} MB",
@@ -1465,85 +1747,185 @@ impl Publisher {
                             ),
                     );
                 }
-                library.into_any_element()
+                v_flex()
+                    .gap_3()
+                    .child(toolbar)
+                    .child(library)
+                    .into_any_element()
             }
             Page::Compose => self.compose(window, cx),
             Page::Jobs => {
-                let active = self
+                let jobs: Vec<_> = self
                     .snapshot
                     .jobs
                     .iter()
-                    .filter(|job| job.state.active())
-                    .count();
-                let waiting = self
-                    .snapshot
-                    .jobs
+                    .filter(|job| self.job_in_scope(job))
+                    .cloned()
+                    .collect();
+                let filter = self.job_account_filter.as_ref();
+                let scoped = filter.is_some();
+                let account = filter
+                    .and_then(|filter| self.snapshot.accounts.iter().find(|a| a.id == filter.id));
+                let heading = filter.map_or_else(
+                    || format!("全部任务 · {}", jobs.len()),
+                    |filter| account.map_or(&filter.alias, |a| &a.alias).clone(),
+                );
+                let scope_detail = filter.map(|filter| {
+                    let platform = filter.platform.name();
+                    let count = jobs.len();
+                    account
+                        .and_then(|a| self.duplicate_alias_suffix(a))
+                        .map_or_else(
+                            || format!("{platform} · {count} 项任务"),
+                            |id| format!("{platform} · {id} · {count} 项任务"),
+                        )
+                });
+                let active = jobs.iter().filter(|job| job.state.active()).count();
+                let waiting = jobs
                     .iter()
                     .filter(|job| job.state == JobState::Queued)
                     .count();
-                let mut view = v_flex().gap_4().child(
+                let queue_count = |label, count, ink| {
                     h_flex()
-                        .justify_between()
-                        .gap_4()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(rgb(CANVAS))
+                        .child(div().text_sm().text_color(rgb(MUTED)).child(label))
                         .child(
                             div()
-                                .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!("全部任务 · {}", self.snapshot.jobs.len())),
+                                .text_color(rgb(ink))
+                                .child(format!("{count}")),
                         )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .child(format!("{active} 个进行中  ·  {waiting} 个排队中")),
+                };
+                let mut view = v_flex()
+                    .gap_3()
+                    .when(scoped, |view| {
+                        view.child(
+                            Button::new("account-jobs-back")
+                                .small()
+                                .ghost()
+                                .self_start()
+                                .w_auto()
+                                .icon(AppIcon::ArrowLeft)
+                                .label(if account.is_some() {
+                                    "返回账号详情"
+                                } else {
+                                    "返回账号管理"
+                                })
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    if let Some(filter) = s.job_account_filter.take() {
+                                        s.navigate(Page::Accounts);
+                                        if s.snapshot.accounts.iter().any(|a| a.id == filter.id) {
+                                            s.open_account(filter.id);
+                                        }
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
+                    .child(
+                        surface().p_4().child(
+                            h_flex()
+                                .justify_between()
+                                .gap_3()
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_3()
+                                        .child(icon_tile(
+                                            AppIcon::ListChecks,
+                                            36.,
+                                            ACCENT,
+                                            ACCENT_WASH,
+                                        ))
+                                        .child(
+                                            v_flex()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(heading),
+                                                )
+                                                .when_some(scope_detail, |labels, detail| {
+                                                    labels.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(rgb(MUTED))
+                                                            .child(detail),
+                                                    )
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .gap_2()
+                                        .child(queue_count("进行中", active, ACCENT))
+                                        .child(queue_count("排队中", waiting, INK)),
+                                ),
                         ),
-                );
-                if self.snapshot.jobs.is_empty() {
+                    );
+                if jobs.is_empty() {
                     view = view.child(
-                        panel()
+                        surface()
                             .items_center()
                             .py_10()
                             .gap_3()
                             .child(icon_tile(AppIcon::ListChecks, 52., ACCENT, ACCENT_WASH))
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("暂无任务"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(MUTED))
-                                    .child("选择账号和素材，创建准备任务。"),
-                            )
-                            .child(
-                                Button::new("jobs-compose")
-                                    .primary()
-                                    .label("新建发布")
-                                    .icon(AppIcon::Plus)
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        s.page = Page::Compose;
-                                        cx.notify();
-                                    })),
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(
+                                if scoped {
+                                    "该账号暂无任务"
+                                } else {
+                                    "暂无任务"
+                                },
+                            ))
+                            .when(!scoped, |empty| {
+                                empty
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(MUTED))
+                                            .child("选择账号和素材，创建准备任务。"),
+                                    )
+                                    .child(
+                                        Button::new("jobs-compose")
+                                            .primary()
+                                            .label("新建发布")
+                                            .icon(AppIcon::Plus)
+                                            .on_click(cx.listener(|s, _, _, cx| {
+                                                s.navigate(Page::Compose);
+                                                cx.notify();
+                                            })),
+                                    )
+                            }),
+                    );
+                } else if jobs.iter().any(|job| {
+                    job.state == JobState::Unknown
+                        || (job.state == JobState::Queued
+                            && !self.snapshot.scheduled_jobs.contains(&job.id))
+                }) {
+                    view =
+                        view.child(
+                            div().px_2().text_sm().text_color(rgb(MUTED)).child(
+                                "重启后可手动继续排队任务。结果待确认的任务需要先到平台核对。",
                             ),
-                    );
-                } else {
-                    view = view.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child("重启后可手动继续排队任务。结果待确认的任务需要先到平台核对。"),
-                    );
+                        );
                 }
-                for j in self.snapshot.jobs.clone() {
+                for j in jobs {
                     let cancel = j.id.clone();
+                    let scheduled = self.snapshot.scheduled_jobs.contains(&j.id);
                     let can_submit = self.snapshot.can_submit(&j);
                     let confirming_publish =
                         can_submit && self.confirming_publish.as_ref() == Some(&j.id);
                     let account_removed =
                         !self.snapshot.accounts.iter().any(|a| a.id == j.account.id);
-                    let mut card = panel()
+                    let mut card = surface()
                         .child(
                             h_flex()
                                 .justify_between()
@@ -1591,10 +1973,24 @@ impl Publisher {
                                 .child(state_pill(j.state)),
                         )
                         .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(MUTED))
-                                .child(j.message.clone()),
+                            div().text_sm().text_color(rgb(MUTED)).child(
+                                if scheduled && j.state == JobState::Queued {
+                                    "已排队，有空位后自动开始准备。".into()
+                                } else if j.state == JobState::WaitingUser
+                                    && j.ready_to_submit
+                                    && !self
+                                        .snapshot
+                                        .submit_enabled_platforms
+                                        .contains(&j.account.platform)
+                                {
+                                    format!(
+                                        "准备完成，当前版本暂未开放{}提交。",
+                                        j.account.platform.name()
+                                    )
+                                } else {
+                                    j.message.clone()
+                                },
+                            ),
                         );
                     if account_removed {
                         card = card.child("账号已删除");
@@ -1693,7 +2089,9 @@ impl Publisher {
                         card =
                             card.child(upload_progress_panel(&j.id, j.account.platform, progress));
                     }
-                    if matches!(j.state, JobState::WaitingUser | JobState::Submitting)
+                    if let Some(sms) = self.publish_sms_panel(&j, window, cx) {
+                        card = card.child(sms);
+                    } else if matches!(j.state, JobState::WaitingUser | JobState::Submitting)
                         && let Some(sign_in) = self.sign_in_panel(&j.account.id, &j.id, cx)
                     {
                         card = card.child(sign_in);
@@ -1764,7 +2162,7 @@ impl Publisher {
                                 Platform::Xiaohongshu => {
                                     url.starts_with("https://www.xiaohongshu.com/explore/")
                                 }
-                                Platform::Simulation => false,
+                                Platform::WechatChannels | Platform::Simulation => false,
                             })
                             .map(|url| ("打开作品链接".to_owned(), url.clone()))
                             .or_else(|| {
@@ -1901,7 +2299,8 @@ impl Publisher {
                                 ),
                         );
                     }
-                    let can_resume = !account_removed
+                    let can_resume = !scheduled
+                        && !account_removed
                         && self
                             .snapshot
                             .can_prepare(j.account.platform, j.content.asset.kind)
@@ -1964,15 +2363,22 @@ impl Publisher {
                 view.into_any_element()
             }
             Page::Settings => {
-                let setting_title = |icon, title, detail| {
+                let wide = workspace_content_width(window) >= 810.;
+                let setting_title = |icon, title, detail: SharedString| {
                     h_flex()
+                        .items_start()
                         .gap_3()
                         .child(icon_tile(icon, 40., ACCENT, ACCENT_WASH))
                         .child(
                             v_flex()
                                 .min_w_0()
                                 .gap_1()
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
                                 .child(div().text_sm().text_color(rgb(MUTED)).child(detail)),
                         )
                 };
@@ -1989,11 +2395,12 @@ impl Publisher {
                                 ));
                             })),
                     );
-                let browser_panel = panel()
+                let browser_panel = surface()
+                    .when(wide, |panel| panel.flex_1())
                     .child(setting_title(
                         AppIcon::PanelTop,
                         "后台浏览器",
-                        "使用 Google Chrome 在后台处理，登录入口在应用内。",
+                        "使用 Google Chrome 在后台处理，登录入口在应用内。".into(),
                     ))
                     .child(
                         v_flex()
@@ -2006,14 +2413,22 @@ impl Publisher {
                             )
                             .child(browser_field),
                     );
-                v_flex()
-                    .gap_4()
-                    .child(browser_panel)
-                    .child(panel().child(setting_title(
+                let queue_panel = surface()
+                    .when(wide, |panel| panel.w(px(270.)).flex_shrink_0())
+                    .child(setting_title(
                         AppIcon::ListChecks,
                         "任务队列",
-                        "同一时间执行一个任务。准备完成后可在任务卡片查看提交操作。",
-                    )))
+                        format!(
+                            "不同账号最多同时执行 {} 个任务，同一账号按顺序执行。每项任务都需单独确认发布。",
+                            publisher_core::MAX_CONCURRENT_JOBS
+                        ).into(),
+                    ));
+                h_flex()
+                    .items_stretch()
+                    .gap_4()
+                    .when(!wide, |row| row.flex_col())
+                    .child(browser_panel)
+                    .child(queue_panel)
                     .into_any_element()
             }
         }
@@ -2067,26 +2482,21 @@ impl Render for Publisher {
             .flex_shrink_0()
             .h_full()
             .px_3()
-            .py_5()
-            .gap_1()
-            .border_r_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(SURFACE))
+            .py_6()
+            .gap_2()
+            .bg(rgb(NAV_SURFACE))
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_3()
                     .px_2()
                     .mb_5()
-                    .child(img(self.product_icon.clone()).size(px(42.)).flex_shrink_0())
+                    .child(img(self.product_icon.clone()).size(px(36.)).flex_shrink_0())
                     .child(
-                        v_flex()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(PRODUCT_NAME),
-                            )
-                            .child(div().text_xs().text_color(rgb(MUTED)).child("多平台发布")),
+                        div()
+                            .text_size(px(20.))
+                            .text_color(rgb(SURFACE))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(PRODUCT_NAME),
                     ),
             );
         for (index, page) in [
@@ -2101,100 +2511,100 @@ impl Render for Publisher {
         .enumerate()
         {
             let active = self.page == page;
-            let ink = if active { ACCENT } else { 0x414e66 };
+            let ink = if active { SURFACE } else { NAV_INK };
+            let icon_ink = if active { NAV_ACCENT } else { 0xa9b6d2 };
             let nav_style = ButtonCustomVariant::new(cx)
-                .color(rgb(if active { ACCENT_WASH } else { SURFACE }).into())
+                .color(rgb(if active { NAV_SELECTED } else { NAV_SURFACE }).into())
                 .foreground(rgb(ink).into())
-                .hover(rgb(if active { 0xe7e3ff } else { CANVAS }).into())
-                .active(rgb(0xe1ddff).into());
-            sidebar = sidebar.child(
-                Button::new(("nav", index))
-                    .accessibility_label(page.title())
-                    .custom(nav_style)
-                    .w_full()
-                    .h(px(40.))
-                    .rounded(px(9.))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_3()
-                            .child(glyph(page.icon(), 17., ink))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_sm()
-                                    .font_weight(if active {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::MEDIUM
-                                    })
-                                    .child(page.title()),
-                            )
-                            .when(active, |row| {
-                                row.child(div().size(px(6.)).rounded_full().bg(rgb(ACCENT)))
-                            }),
-                    )
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        s.page = page;
-                        s.photo_preview = None;
-                        s.account_details = None;
-                        if page != Page::Jobs {
-                            s.confirming_publish = None;
-                            s.confirming_not_published = None;
-                            s.confirming_delete_job = None;
-                        }
-                        cx.notify();
-                    })),
-            );
+                .hover(rgb(if active { NAV_SELECTED } else { NAV_HOVER }).into())
+                .active(rgb(NAV_SELECTED).into());
+            sidebar = sidebar
+                .when(page == Page::Settings, |rail| rail.child(div().flex_1()))
+                .child(
+                    Button::new(("nav", index))
+                        .accessibility_label(page.title())
+                        .custom(nav_style)
+                        .when(active, |button| button.bg(rgb(NAV_SELECTED)))
+                        .w_full()
+                        .h(px(40.))
+                        .rounded(px(9.))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_3()
+                                .child(glyph(page.icon(), 17., icon_ink))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_sm()
+                                        .font_weight(if active {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::MEDIUM
+                                        })
+                                        .child(page.title()),
+                                ),
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.navigate(page);
+                            cx.notify();
+                        })),
+                );
         }
-        let account_details = self
-            .account_details
-            .as_ref()
-            .filter(|_| self.page == Page::Accounts);
-        let scroll_id = account_details.map_or_else(
-            || ElementId::from(("page-scroll", self.page as usize)),
-            |details| eid("account-detail-scroll", &details.id),
-        );
+        let scroll_id = match self.page {
+            Page::Accounts => self
+                .account_details
+                .as_ref()
+                .map(|details| eid("account-detail-scroll", &details.id)),
+            Page::Jobs => self
+                .job_account_filter
+                .as_ref()
+                .map(|account| eid("account-jobs-scroll", &account.id)),
+            _ => None,
+        }
+        .unwrap_or_else(|| ElementId::from(("page-scroll", self.page as usize)));
         let photo_gallery = self.photo_gallery(window, cx);
         let previewing_photos = photo_gallery.is_some();
         let body = photo_gallery.map_or_else(|| self.body(window, cx), Div::into_any_element);
-        let publish_sms = self.publish_sms_panel(window, cx);
+        let fill_viewport = self.page == Page::Overview && !previewing_photos;
+        let sms_notice = self.publish_sms_notice(cx);
+        let has_notice = sms_notice.is_some() || !self.message.is_empty();
         let mut workspace = v_flex().flex_1().h_full().min_w_0();
-        if let Some(publish_sms) = publish_sms {
-            workspace = workspace.child(publish_sms);
+        if let Some(sms_notice) = sms_notice {
+            workspace = workspace.child(workspace_frame().pt_3().flex_shrink_0().child(sms_notice));
         }
         if !self.message.is_empty() {
             workspace = workspace.child(
-                h_flex()
-                    .mx_7()
-                    .mt_4()
-                    .px_3()
-                    .py_2()
-                    .gap_3()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(rgb(0xe1def9))
-                    .bg(rgb(0xf1effe))
-                    .child(glyph(AppIcon::Info, 16., ACCENT))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(rgb(0x3e367e))
-                            .child(self.message.clone()),
-                    )
-                    .child(
-                        Button::new("dismiss-message")
-                            .ghost()
-                            .xsmall()
-                            .icon(AppIcon::X)
-                            .accessibility_label("关闭提示")
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.message.clear();
-                                cx.notify();
-                            })),
-                    ),
+                workspace_frame().pt_3().flex_shrink_0().child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_3()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(ACCENT_WASH))
+                        .child(glyph(AppIcon::Info, 16., ACCENT))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .text_color(rgb(INK))
+                                .child(self.message.clone()),
+                        )
+                        .child(
+                            Button::new("dismiss-message")
+                                .ghost()
+                                .xsmall()
+                                .icon(AppIcon::X)
+                                .accessibility_label("关闭提示")
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.message.clear();
+                                    cx.notify();
+                                })),
+                        ),
+                ),
             );
         }
         workspace = workspace.child(
@@ -2202,14 +2612,12 @@ impl Render for Publisher {
                 .id(scroll_id)
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
+                .when(!fill_viewport, |viewport| viewport.overflow_y_scroll())
                 .child(
-                    v_flex()
-                        .w_full()
-                        .max_w(px(WORKSPACE_MAX_WIDTH))
-                        .mx_auto()
-                        .px(px(WORKSPACE_PADDING))
-                        .py_5()
+                    workspace_frame()
+                        .when(fill_viewport, |frame| frame.h_full().min_h_0())
+                        .pt(px(if has_notice { 12. } else { 24. }))
+                        .pb_6()
                         .child(body),
                 ),
         );

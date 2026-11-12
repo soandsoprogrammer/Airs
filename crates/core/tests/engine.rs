@@ -9,16 +9,19 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 struct AuditAdapter {
     submits: Arc<AtomicUsize>,
     unknown: bool,
     stalled_budget: Option<Duration>,
+    rendezvous: Option<Arc<Barrier>>,
 }
 struct AuditPrepared {
     ctx: RunContext,
     submits: Arc<AtomicUsize>,
     unknown: bool,
+    rendezvous: Option<Arc<Barrier>>,
 }
 #[async_trait]
 impl PlatformAdapter for AuditAdapter {
@@ -43,10 +46,14 @@ impl PlatformAdapter for AuditAdapter {
         if self.stalled_budget.is_some() {
             pending::<()>().await;
         }
+        if let Some(barrier) = &self.rendezvous {
+            barrier.wait().await;
+        }
         Ok(Box::new(AuditPrepared {
             ctx,
             submits: self.submits.clone(),
             unknown: self.unknown,
+            rendezvous: self.rendezvous.clone(),
         }))
     }
 }
@@ -60,11 +67,14 @@ impl Prepared for AuditPrepared {
         Ok(())
     }
     async fn inspect_result(&mut self) -> Result<Option<Receipt>> {
+        if let Some(barrier) = &self.rendezvous {
+            barrier.wait().await;
+        }
         if self.unknown {
             Ok(None)
         } else {
             Ok(Some(Receipt {
-                platform_id: "fixture-001".into(),
+                platform_id: format!("fixture-{}", self.ctx.job.id),
                 evidence: "本地夹具回执，不是真实平台".into(),
                 url: None,
             }))
@@ -81,12 +91,13 @@ fn setup_with_stalled_budget(
     unknown: bool,
     stalled_budget: Option<Duration>,
 ) -> (tempfile::TempDir, Store, Engine, Job, Arc<AtomicUsize>) {
-    setup_for_platform(Platform::Simulation, unknown, stalled_budget)
+    setup_for_platform(Platform::Simulation, unknown, stalled_budget, None)
 }
 fn setup_for_platform(
     platform: Platform,
     unknown: bool,
     stalled_budget: Option<Duration>,
+    rendezvous: Option<Arc<Barrier>>,
 ) -> (tempfile::TempDir, Store, Engine, Job, Arc<AtomicUsize>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
@@ -112,6 +123,7 @@ fn setup_for_platform(
         submits: count.clone(),
         unknown,
         stalled_budget,
+        rendezvous,
     });
     let engine = Engine::new(store.clone(), vec![(platform, adapter)]);
     (dir, store, engine, j, count)
@@ -144,7 +156,8 @@ async fn dry_run_stops_then_one_submit_has_committed_state() {
 }
 #[tokio::test]
 async fn changed_douyin_cover_stops_before_submission() {
-    let (_dir, store, engine, job, submissions) = setup_for_platform(Platform::Douyin, false, None);
+    let (_dir, store, engine, job, submissions) =
+        setup_for_platform(Platform::Douyin, false, None, None);
     engine.start(job.id.clone()).unwrap();
     wait(&store, &job.id, JobState::WaitingUser).await;
     let cover = job.content.douyin_video_covers.portrait.as_ref().unwrap();
@@ -188,7 +201,7 @@ async fn adapter_preparation_timeout_fails_before_submit() {
     assert_eq!(submissions.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
-async fn queued_job_waits_for_first_account_and_can_be_cancelled() {
+async fn same_account_queued_job_can_be_cancelled_while_first_waits() {
     let (_dir, s, e, j, _) = setup(false);
     let second = s
         .enqueue("second", std::slice::from_ref(&j.account), &j.content)
@@ -201,6 +214,140 @@ async fn queued_job_waits_for_first_account_and_can_be_cancelled() {
     assert_eq!(s.job(&second.id).unwrap().state, JobState::Queued);
     e.cancel(&second.id).unwrap();
     wait(&s, &second.id, JobState::Cancelled).await;
+    assert_eq!(s.job(&j.id).unwrap().state, JobState::WaitingUser);
+    assert!(
+        s.events(&second.id)
+            .unwrap()
+            .iter()
+            .all(|event| !event.state.active())
+    );
     e.cancel(&j.id).unwrap();
     wait(&s, &j.id, JobState::Cancelled).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_accounts_on_one_platform_prepare_and_submit_concurrently() {
+    let rendezvous = Arc::new(Barrier::new(3));
+    let (_dir, store, engine, first, submissions) =
+        setup_for_platform(Platform::Simulation, false, None, Some(rendezvous.clone()));
+    let other_account = store
+        .add_account("另一个本地测试账号", first.account.platform)
+        .unwrap();
+    let second = store
+        .enqueue("other-account", &[other_account], &first.content)
+        .unwrap()
+        .remove(0);
+
+    for job in [&first, &second] {
+        engine.start(job.id.clone()).unwrap();
+    }
+    for job in [&first, &second] {
+        wait(&store, &job.id, JobState::Uploading).await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), rendezvous.wait())
+        .await
+        .expect("both accounts should reach the preparation barrier");
+    for job in [&first, &second] {
+        wait(&store, &job.id, JobState::WaitingUser).await;
+    }
+    assert_eq!(submissions.load(Ordering::SeqCst), 0);
+
+    for job in [&first, &second] {
+        engine.submit(&job.id).unwrap();
+    }
+    for job in [&first, &second] {
+        wait(&store, &job.id, JobState::Submitting).await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), rendezvous.wait())
+        .await
+        .expect("both accounts should reach the submission barrier");
+    assert_eq!(submissions.load(Ordering::SeqCst), 2);
+    for job in [&first, &second] {
+        wait(&store, &job.id, JobState::Submitted).await;
+        let receipt = store.job(&job.id).unwrap().result.unwrap();
+        assert_eq!(receipt.platform_id, format!("fixture-{}", job.id));
+    }
+}
+
+#[tokio::test]
+async fn same_account_queue_advances_in_start_order() {
+    let (_dir, store, engine, first, _) = setup(false);
+    let account = std::slice::from_ref(&first.account);
+    let second = store
+        .enqueue("second", account, &first.content)
+        .unwrap()
+        .remove(0);
+    let third = store
+        .enqueue("third", account, &first.content)
+        .unwrap()
+        .remove(0);
+    engine.start(first.id.clone()).unwrap();
+    wait(&store, &first.id, JobState::WaitingUser).await;
+    engine.start(second.id.clone()).unwrap();
+    engine.start(third.id.clone()).unwrap();
+    engine.submit(&first.id).unwrap();
+
+    wait(&store, &second.id, JobState::WaitingUser).await;
+    assert_eq!(store.job(&first.id).unwrap().state, JobState::Submitted);
+    assert_eq!(store.job(&third.id).unwrap().state, JobState::Queued);
+
+    engine.cancel(&second.id).unwrap();
+    wait(&store, &third.id, JobState::WaitingUser).await;
+    assert_eq!(store.job(&second.id).unwrap().state, JobState::Cancelled);
+    engine.cancel(&third.id).unwrap();
+    wait(&store, &third.id, JobState::Cancelled).await;
+}
+
+#[tokio::test]
+async fn busy_account_queue_leaves_slots_for_other_accounts_up_to_the_limit() {
+    let (_dir, store, engine, first, _) = setup(false);
+    let waiting_for_first = ["second", "third"].map(|key| {
+        store
+            .enqueue(key, std::slice::from_ref(&first.account), &first.content)
+            .unwrap()
+            .remove(0)
+    });
+    let other_accounts: Vec<_> = (0..MAX_CONCURRENT_JOBS)
+        .map(|index| {
+            store
+                .add_account(&format!("测试账号 {index}"), first.account.platform)
+                .unwrap()
+        })
+        .collect();
+    let other_jobs = store
+        .enqueue("other-accounts", &other_accounts, &first.content)
+        .unwrap();
+    let (last, within_limit) = other_jobs.split_last().unwrap();
+
+    engine.start(first.id.clone()).unwrap();
+    wait(&store, &first.id, JobState::WaitingUser).await;
+    for job in waiting_for_first.iter().chain(&other_jobs) {
+        engine.start(job.id.clone()).unwrap();
+    }
+    for job in within_limit {
+        wait(&store, &job.id, JobState::WaitingUser).await;
+    }
+    for job in waiting_for_first.iter().chain(std::iter::once(last)) {
+        assert_eq!(store.job(&job.id).unwrap().state, JobState::Queued);
+    }
+
+    engine.cancel(&within_limit[0].id).unwrap();
+    wait(&store, &last.id, JobState::WaitingUser).await;
+    assert_eq!(
+        store.job(&within_limit[0].id).unwrap().state,
+        JobState::Cancelled
+    );
+    assert_eq!(store.job(&first.id).unwrap().state, JobState::WaitingUser);
+    for job in &waiting_for_first {
+        assert_eq!(store.job(&job.id).unwrap().state, JobState::Queued);
+    }
+
+    engine.cancel_all();
+    for job in std::iter::once(&first)
+        .chain(&waiting_for_first)
+        .chain(&other_jobs)
+    {
+        wait(&store, &job.id, JobState::Cancelled).await;
+    }
+    assert_eq!(engine.active_count(), 0);
 }

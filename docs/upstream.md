@@ -17,8 +17,11 @@ SAU 为 MIT，版权归 dreammis (c) 2023。许可保存在 [SAU-LICENSE.txt](SA
 | 抖音 | [DouYinVideo 和 DouYinNote](https://github.com/dreammis/social-auto-upload/blob/3847fff01f5434a8a32829833163cd6723cabc59/uploader/douyin_uploader/main.py) | 创作者中心扫码、切换发布类型、上传素材、填写标题与正文、处理发布验证 |
 | 快手 | [KSVideo 和 KSNote](https://github.com/dreammis/social-auto-upload/blob/3847fff01f5434a8a32829833163cd6723cabc59/uploader/ks_uploader/main.py) | 创作者服务平台扫码、图文上传按钮和文件选择器、作品描述、发布确认 |
 | 小红书 | [XiaoHongShuVideo 和 XiaoHongShuNote](https://github.com/dreammis/social-auto-upload/blob/3847fff01f5434a8a32829833163cd6723cabc59/uploader/xiaohongshu_uploader/main.py) | 创作服务平台登录、按视频和图文类型打开编辑页、上传和填写笔记 |
+| 视频号 | [TencentVideo](https://github.com/dreammis/social-auto-upload/blob/3847fff01f5434a8a32829833163cd6723cabc59/uploader/tencent_uploader/main.py) | 微信扫码、从助手首页进入发表页、上传视频和填写文案 |
 
 桌面应用先准备作品，再等待用户确认。提交后依据平台回执记录接收结果。结果无法确认时，任务保留在「结果待确认」，可从任务卡片打开平台管理页核对。
+
+视频号的编辑器、上传完成标记和立即发表回执按当前公开页面复核。管理员扫码验证属于独立流程，收到验证要求时任务保留待确认结果。[视频号助手](https://channels.weixin.qq.com/platform/) · [发布编辑器](https://res.wx.qq.com/t/wx_fed/finder/helper/content/finder-helper-content/res/static/js/async/173.71ec1852.js) · [回执判断](https://res.wx.qq.com/t/wx_fed/finder/helper/content/finder-helper-content/res/static/js/async/530.552fef16.js)
 
 昵称读取额外核对了抖音官方页面引用的公开静态资源：
 

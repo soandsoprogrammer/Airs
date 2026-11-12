@@ -7,13 +7,15 @@ pub enum Platform {
     Douyin,
     Kuaishou,
     Xiaohongshu,
+    WechatChannels,
     Simulation,
 }
 impl Platform {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Douyin,
         Self::Kuaishou,
         Self::Xiaohongshu,
+        Self::WechatChannels,
         Self::Simulation,
     ];
 
@@ -22,6 +24,7 @@ impl Platform {
             Self::Douyin => "抖音",
             Self::Kuaishou => "快手",
             Self::Xiaohongshu => "小红书",
+            Self::WechatChannels => "视频号",
             Self::Simulation => "模拟测试",
         }
     }
@@ -48,6 +51,8 @@ impl SessionStatus {
         }
     }
 }
+pub const ACCOUNT_NOTE_LIMIT: usize = 1_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
@@ -59,6 +64,8 @@ pub struct Account {
     pub nickname: Option<String>,
     #[serde(default = "preserve_existing_alias")]
     pub alias_customized: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 fn preserve_existing_alias() -> bool {
     true
@@ -308,6 +315,7 @@ impl Content {
                 Platform::Douyin => (35, 50 * MIB, "最多 50 MB"),
                 Platform::Kuaishou => (31, 15 * MIB - 1, "须小于 15 MB"),
                 Platform::Xiaohongshu => (18, 32 * MIB, "最多 32 MB"),
+                Platform::WechatChannels => bail!("视频号图文发布尚未接入"),
                 Platform::Simulation => return Ok(()),
             };
             ensure!(
@@ -456,6 +464,7 @@ pub struct Receipt {
     pub url: Option<String>,
 }
 pub const XIAOHONGSHU_ACCEPTED_EVIDENCE: &str = "小红书创作服务平台确认已接收笔记";
+pub const WECHAT_CHANNELS_ACCEPTED_EVIDENCE: &str = "视频号助手确认已接收作品";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobEvent {
     pub time: String,

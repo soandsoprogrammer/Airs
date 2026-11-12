@@ -28,28 +28,104 @@ impl CoverOrientation {
 impl Publisher {
     pub(super) fn compose(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let wide = workspace_content_width(window) >= 760.;
-        div()
-            .flex()
-            .gap_4()
+        v_flex()
             .w_full()
-            .when(wide, |layout| layout.flex_row().items_start())
-            .when(!wide, |layout| layout.flex_col())
+            .gap_4()
+            .child(self.compose_toolbar(cx))
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
+                div()
+                    .flex()
+                    .w_full()
                     .gap_4()
-                    .child(self.compose_media(cx))
-                    .when(self.has_selected_douyin_account(), |layout| {
-                        layout.child(self.compose_douyin_settings(cx))
-                    })
-                    .child(self.compose_fields(cx)),
-            )
-            .child(
-                self.compose_accounts(cx)
-                    .when(wide, |panel| panel.w(px(326.)).flex_shrink_0()),
+                    .when(wide, |layout| layout.flex_row().items_start())
+                    .when(!wide, |layout| layout.flex_col())
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_4()
+                            .child(self.compose_media(cx))
+                            .when(!wide, |layout| layout.child(self.compose_accounts(cx)))
+                            .child(self.compose_fields(cx))
+                            .when(self.has_selected_douyin_account(), |layout| {
+                                layout.child(self.compose_douyin_settings(cx))
+                            }),
+                    )
+                    .when(wide, |layout| {
+                        layout.child(self.compose_accounts(cx).w(px(304.)).flex_shrink_0())
+                    }),
             )
             .into_any_element()
+    }
+
+    fn compose_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .w_full()
+            .justify_between()
+            .flex_wrap()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .p_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .children(
+                        [(MediaKind::Video, "视频"), (MediaKind::Images, "图文")].map(
+                            |(choice, label)| {
+                                let selected = choice == self.compose_media_kind;
+                                Button::new(eid("compose-kind", label))
+                                    .small()
+                                    .ghost()
+                                    .h(px(30.))
+                                    .w(px(88.))
+                                    .icon(media_icon(choice))
+                                    .label(label)
+                                    .toggled(selected)
+                                    .when(selected, |button| {
+                                        button.bg(rgb(ACCENT_WASH)).text_color(rgb(ACCENT))
+                                    })
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        if s.compose_media_kind != choice {
+                                            s.compose_media_kind = choice;
+                                            s.selected_asset = None;
+                                            s.compose_image_order.clear();
+                                            s.compose_asset_picker_open = false;
+                                            s.reset_compose_batch();
+                                            cx.notify();
+                                        }
+                                    }))
+                            },
+                        ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("restore-draft")
+                            .small()
+                            .ghost()
+                            .label("恢复草稿")
+                            .disabled(self.snapshot.draft.is_none())
+                            .on_click(cx.listener(|s, _, window, cx| {
+                                s.restore_compose_draft(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("save-draft")
+                            .small()
+                            .label("保存草稿")
+                            .disabled(self.compose_selected_asset().is_none())
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                if let Some(content) = s.content(cx) {
+                                    s.backend.send(Command::SaveDraft(content));
+                                }
+                            })),
+                    ),
+            )
     }
 
     fn has_selected_douyin_account(&self) -> bool {
@@ -59,19 +135,17 @@ impl Publisher {
     }
 
     fn compose_douyin_settings(&self, cx: &mut Context<Self>) -> Div {
-        let panel = surface().gap_3().child(section_title("抖音设置"));
+        let panel = surface().gap_3().child(section_title("抖音封面"));
         if self.compose_media_kind == MediaKind::Images {
             return panel.child(muted_text("图文以第一张图片作为封面。"));
         }
-        panel
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_stretch()
-                    .child(self.compose_cover_slot(CoverOrientation::Portrait, cx))
-                    .child(self.compose_cover_slot(CoverOrientation::Landscape, cx)),
-            )
-            .child(muted_text("未选择的封面沿用抖音默认设置。"))
+        panel.child(
+            h_flex()
+                .gap_3()
+                .items_stretch()
+                .child(self.compose_cover_slot(CoverOrientation::Portrait, cx))
+                .child(self.compose_cover_slot(CoverOrientation::Landscape, cx)),
+        )
     }
 
     fn compose_cover_slot(&self, orientation: CoverOrientation, cx: &mut Context<Self>) -> Div {
@@ -209,12 +283,18 @@ impl Publisher {
             .iter()
             .filter(|asset| asset.kind == kind);
         let has_assets = available.clone().next().is_some();
-        let (heading, import_label, empty_hint) = match kind {
-            MediaKind::Video => ("视频素材", "导入视频", "支持 MP4、MOV、M4V 和 WebM。"),
+        let (heading, import_label, empty_label, empty_hint) = match kind {
+            MediaKind::Video => (
+                "视频素材",
+                "导入视频",
+                "未选择视频",
+                "支持 MP4、MOV、M4V 和 WebM。",
+            ),
             MediaKind::Images => (
                 "图文素材",
                 "导入图片",
-                "可一次选多张 JPG、PNG 或 WebP 图片，导入后可以调整顺序。",
+                "未选择图片",
+                "可一次选择多张 JPG、PNG 或 WebP 图片。",
             ),
         };
         let browse_label = if self.compose_asset_picker_open {
@@ -224,82 +304,61 @@ impl Publisher {
         } else {
             "选择素材"
         };
-        let mut panel = surface()
-            .gap_3()
-            .child(
-                h_flex().gap_2().children(
-                    [
-                        (MediaKind::Video, "视频", AppIcon::Video),
-                        (MediaKind::Images, "图文", AppIcon::Image),
-                    ]
-                    .map(|(choice, label, icon)| {
-                        let selected = choice == kind;
-                        Button::new(eid("compose-kind", label))
-                            .small()
-                            .ghost()
-                            .icon(icon)
-                            .label(label)
-                            .toggled(selected)
-                            .when(selected, |button| {
-                                button.bg(rgb(ACCENT_WASH)).text_color(rgb(ACCENT))
-                            })
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                if s.compose_media_kind != choice {
-                                    s.compose_media_kind = choice;
-                                    s.selected_asset = None;
-                                    s.compose_image_order.clear();
-                                    s.compose_asset_picker_open = false;
-                                    s.reset_compose_batch();
-                                    cx.notify();
-                                }
-                            }))
-                    }),
-                ),
-            )
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .justify_between()
-                    .gap_2()
-                    .child(section_title(heading))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("compose-import-media")
-                                    .icon(AppIcon::Plus)
-                                    .label(import_label)
-                                    .on_click(
-                                        cx.listener(move |s, _, _, cx| s.pick_media(kind, cx)),
-                                    ),
+        let mut panel = surface().gap_3().child(
+            h_flex()
+                .flex_wrap()
+                .justify_between()
+                .gap_2()
+                .child(section_title(heading))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("compose-import-media")
+                                .small()
+                                .when(has_assets, |button| button.ghost())
+                                .icon(AppIcon::Plus)
+                                .label(import_label)
+                                .on_click(cx.listener(move |s, _, _, cx| s.pick_media(kind, cx))),
+                        )
+                        .when(has_assets, |actions| {
+                            actions.child(
+                                Button::new("compose-toggle-library")
+                                    .small()
+                                    .icon(AppIcon::FolderOpen)
+                                    .label(browse_label)
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.compose_asset_picker_open = !s.compose_asset_picker_open;
+                                        cx.notify();
+                                    })),
                             )
-                            .when(has_assets, |actions| {
-                                actions.child(
-                                    Button::new("compose-toggle-library")
-                                        .ghost()
-                                        .label(browse_label)
-                                        .on_click(cx.listener(|s, _, _, cx| {
-                                            s.compose_asset_picker_open =
-                                                !s.compose_asset_picker_open;
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
-                    ),
-            );
+                        }),
+                ),
+        );
         panel = panel.child(if let Some(asset) = picked.as_ref() {
             h_flex()
                 .justify_between()
                 .gap_3()
                 .p_3()
                 .rounded(px(10.))
+                .border_1()
+                .border_color(rgb(BORDER))
                 .bg(rgb(CANVAS))
                 .child(asset_label(asset).flex_1())
                 .child(self.preview_button(asset, cx))
-        } else if !has_assets {
-            muted_text(empty_hint)
         } else {
-            muted_text("从素材库选择，或导入本地文件。")
+            h_flex()
+                .gap_3()
+                .p_3()
+                .rounded(px(10.))
+                .bg(rgb(CANVAS))
+                .child(icon_tile(media_icon(kind), 36., ACCENT, ACCENT_WASH))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(field_title(empty_label))
+                        .child(muted_text(empty_hint)),
+                )
         });
         if self.compose_asset_picker_open && has_assets {
             panel = panel.child(
@@ -325,7 +384,12 @@ impl Publisher {
             );
         }
         if let Some(asset) = picked.filter(|asset| asset.kind == MediaKind::Images) {
-            panel = panel.child(self.compose_image_sequence(&asset, cx));
+            panel = panel.child(
+                v_flex()
+                    .gap_1()
+                    .child(field_title("图片顺序"))
+                    .child(self.compose_image_sequence(&asset, cx)),
+            );
         }
         panel
     }
@@ -427,38 +491,7 @@ impl Publisher {
         };
         surface()
             .gap_4()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(section_title("作品内容"))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("save-draft")
-                                    .small()
-                                    .label("保存草稿")
-                                    .disabled(self.compose_selected_asset().is_none())
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        if let Some(content) = s.content(cx) {
-                                            s.backend.send(Command::SaveDraft(content));
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("restore-draft")
-                                    .small()
-                                    .ghost()
-                                    .label("恢复草稿")
-                                    .disabled(self.snapshot.draft.is_none())
-                                    .on_click(cx.listener(|s, _, window, cx| {
-                                        s.restore_compose_draft(window, cx);
-                                    })),
-                            ),
-                    ),
-            )
+            .child(section_title("作品内容"))
             .child(
                 v_flex()
                     .gap_2()
@@ -514,7 +547,12 @@ impl Publisher {
         if self.snapshot.accounts.is_empty() {
             return panel.child(muted_text("请先添加一个发布账号。"));
         }
-        let mut filters = h_flex().flex_wrap().gap_1();
+        let mut filters = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .pb_3();
         for platform in std::iter::once(None).chain(ACCOUNT_PLATFORMS.into_iter().map(Some)) {
             let label = platform.map_or("全部", Platform::name);
             let selected = self.compose_account_filter == platform;
@@ -662,7 +700,7 @@ impl Publisher {
         } else {
             (
                 "开始准备",
-                missing.unwrap_or("准备会上传素材，停在最终提交前。"),
+                missing.unwrap_or("上传素材后，等待你确认发布。"),
             )
         };
         let media = picked.map_or("未选素材".into(), asset_name);
@@ -672,13 +710,17 @@ impl Publisher {
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
             .child(
-                h_flex()
-                    .w_full()
-                    .max_w(px(WORKSPACE_MAX_WIDTH))
-                    .mx_auto()
-                    .px(px(WORKSPACE_PADDING))
+                workspace_frame()
+                    .flex_row()
+                    .items_center()
                     .py_3()
-                    .gap_4()
+                    .gap_3()
+                    .child(icon_tile(
+                        media_icon(self.compose_media_kind),
+                        36.,
+                        ACCENT,
+                        ACCENT_WASH,
+                    ))
                     .child(
                         v_flex()
                             .flex_1()
@@ -702,7 +744,8 @@ impl Publisher {
                     .child(
                         Button::new("enqueue")
                             .primary()
-                            .h(px(36.))
+                            .h(px(38.))
+                            .w(px(124.))
                             .label(label)
                             .disabled(
                                 self.pending_batch.is_some() || (missing.is_some() && !self.queued),
@@ -839,7 +882,7 @@ impl Publisher {
 
 fn section_title(label: &'static str) -> Div {
     div()
-        .text_base()
+        .text_size(px(17.))
         .font_weight(FontWeight::SEMIBOLD)
         .child(label)
 }

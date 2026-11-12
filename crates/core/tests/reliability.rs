@@ -222,10 +222,13 @@ fn recording_idless_acceptance_requires_platform_evidence() {
     let (_dir, store, douyin, content) = setup();
     let kuaishou = store.add_account("快手", Platform::Kuaishou).unwrap();
     let xiaohongshu = store.add_account("小红书", Platform::Xiaohongshu).unwrap();
+    let wechat_channels = store
+        .add_account("视频号", Platform::WechatChannels)
+        .unwrap();
     let jobs = store
         .enqueue(
             "platform-acknowledgements",
-            &[douyin, kuaishou, xiaohongshu],
+            &[douyin, kuaishou, xiaohongshu, wechat_channels],
             &content,
         )
         .unwrap();
@@ -257,11 +260,42 @@ fn recording_idless_acceptance_requires_platform_evidence() {
         evidence: XIAOHONGSHU_ACCEPTED_EVIDENCE.into(),
         url: None,
     };
+    assert!(
+        store
+            .received(&jobs[3].id, xhs_acknowledgement.clone())
+            .is_err()
+    );
     let accepted = store
         .received(&jobs[2].id, xhs_acknowledgement.clone())
         .unwrap();
     assert_eq!(accepted.state, JobState::Submitted);
     assert_eq!(accepted.result, Some(xhs_acknowledgement));
+    let wechat_acknowledgement = Receipt {
+        platform_id: String::new(),
+        evidence: WECHAT_CHANNELS_ACCEPTED_EVIDENCE.into(),
+        url: None,
+    };
+    assert!(
+        store
+            .received(&jobs[0].id, wechat_acknowledgement.clone())
+            .is_err()
+    );
+    assert!(
+        store
+            .received(
+                &jobs[3].id,
+                Receipt {
+                    url: Some("https://channels.weixin.qq.com/platform/post/list".into()),
+                    ..wechat_acknowledgement.clone()
+                }
+            )
+            .is_err()
+    );
+    let accepted = store
+        .received(&jobs[3].id, wechat_acknowledgement.clone())
+        .unwrap();
+    assert_eq!(accepted.state, JobState::Submitted);
+    assert_eq!(accepted.result, Some(wechat_acknowledgement));
 }
 #[test]
 fn confirming_no_publish_records_evidence_before_retry_is_allowed() {
@@ -375,7 +409,9 @@ fn image_order_and_media_kind_survive_draft_and_cross_platform_batch() {
     let (dir, store, douyin, mut content) = setup();
     let kuaishou = store.add_account("", Platform::Kuaishou).unwrap();
     let xiaohongshu = store.add_account("", Platform::Xiaohongshu).unwrap();
+    let wechat_channels = store.add_account("", Platform::WechatChannels).unwrap();
     assert_eq!(xiaohongshu.alias, "小红书账号 1");
+    assert_eq!(wechat_channels.alias, "视频号账号 1");
     let second = dir.path().join("second.png");
     let first = dir.path().join("first.JPG");
     std::fs::write(&first, b"fixture first").unwrap();
@@ -393,6 +429,15 @@ fn image_order_and_media_kind_survive_draft_and_cross_platform_batch() {
     );
     store.save_draft("photo-draft", &content).unwrap();
     assert_eq!(store.draft("photo-draft").unwrap(), Some(content.clone()));
+    let error = store
+        .enqueue(
+            "unsupported-photos",
+            &[douyin.clone(), wechat_channels],
+            &content,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("视频号图文发布尚未接入"));
+    assert!(store.jobs().unwrap().is_empty());
     let jobs = store
         .enqueue("photos", &[douyin, kuaishou, xiaohongshu], &content)
         .unwrap();
@@ -476,6 +521,51 @@ fn automatic_nickname_defaults_and_custom_name_survive_session_refresh() {
     assert_eq!(a.alias, "品牌主号");
     assert_eq!(a.nickname.as_deref(), Some("新平台昵称"));
     assert!(a.alias_customized);
+}
+
+#[test]
+fn account_notes_persist_without_becoming_part_of_job_history() {
+    let (dir, store, account, content) = setup();
+    let legacy = serde_json::to_value(&account).unwrap();
+    assert!(legacy.get("note").is_none());
+    assert!(
+        serde_json::from_value::<Account>(legacy)
+            .unwrap()
+            .note
+            .is_empty()
+    );
+
+    let note = "  运营账号🙂\n审核后使用\n";
+    store.save_account_note(&account.id, note).unwrap();
+    store.rename_account(&account.id, "品牌号").unwrap();
+    store
+        .sync_session(&account.id, SessionStatus::Ready, Some("平台昵称".into()))
+        .unwrap();
+    let reopened = Store::open(dir.path()).unwrap();
+    let saved = reopened.accounts().unwrap().remove(0);
+    assert_eq!(saved.note, note);
+    assert_eq!(saved.alias, "品牌号");
+    assert_eq!(saved.nickname.as_deref(), Some("平台昵称"));
+    assert_eq!(saved.session, SessionStatus::Ready);
+
+    let oversized = "字".repeat(ACCOUNT_NOTE_LIMIT + 1);
+    assert!(reopened.save_account_note(&saved.id, &oversized).is_err());
+    assert_eq!(reopened.accounts().unwrap()[0].note, note);
+    let job = reopened
+        .enqueue("account-note", std::slice::from_ref(&saved), &content)
+        .unwrap()
+        .remove(0);
+    assert!(job.account.note.is_empty());
+    assert!(reopened.job(&job.id).unwrap().account.note.is_empty());
+
+    reopened.save_account_note(&saved.id, "").unwrap();
+    assert!(store.accounts().unwrap()[0].note.is_empty());
+    reopened
+        .transition(&job.id, JobState::Cancelled, "取消测试任务")
+        .unwrap();
+    reopened.remove_account(&saved.id).unwrap();
+    assert!(reopened.save_account_note(&saved.id, note).is_err());
+    assert!(store.accounts().unwrap().is_empty());
 }
 
 #[test]

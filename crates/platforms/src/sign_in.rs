@@ -26,6 +26,7 @@ pub struct SignInPreview {
     pub verification_id: Option<u64>,
     pub input_feedback: Option<&'static str>,
     pub publish_sms: Option<PublishSmsPreview>,
+    pub wechat_channels: Option<WechatChannelsPreview>,
 }
 
 impl SignInPreview {
@@ -40,6 +41,7 @@ impl SignInPreview {
             self.verification_id = None;
             self.input_feedback = None;
             self.publish_sms = None;
+            self.wechat_channels = None;
         }
     }
 
@@ -55,6 +57,22 @@ impl SignInPreview {
                 VerificationAction::Click { .. } | VerificationAction::FillText(_) => {
                     self.verification.is_some()
                 }
+                VerificationAction::WechatQuickLogin => matches!(
+                    self.wechat_channels,
+                    Some(WechatChannelsPreview::Choice { .. })
+                ),
+                VerificationAction::WechatScanLogin => matches!(
+                    self.wechat_channels,
+                    Some(
+                        WechatChannelsPreview::Choice { .. }
+                            | WechatChannelsPreview::WaitingForDesktop
+                    )
+                ),
+                VerificationAction::WechatSelectChannel { index } => matches!(
+                    &self.wechat_channels,
+                    Some(WechatChannelsPreview::SelectChannel { channels })
+                        if channels.get(*index).is_some_and(|channel| channel.available)
+                ),
             }
     }
 }
@@ -73,11 +91,28 @@ pub struct PublishSmsPreview {
     pub resend_seconds: Option<u16>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WechatChannelsPreview {
+    Choice { nickname: String },
+    WaitingForDesktop,
+    SelectChannel { channels: Vec<WechatChannelChoice> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WechatChannelChoice {
+    pub nickname: String,
+    pub role: String,
+    pub available: bool,
+}
+
 pub enum VerificationAction {
     Click { x: f64, y: f64 },
     FillText(String),
     RequestSmsCode,
     VerifySmsCode(String),
+    WechatQuickLogin,
+    WechatScanLogin,
+    WechatSelectChannel { index: usize },
 }
 
 struct SignIn {
@@ -184,6 +219,7 @@ impl SignInGuard {
         preview.set_status(SignInStatus::VerifyInApp);
         preview.png = None;
         preview.publish_sms = None;
+        preview.wechat_channels = None;
         if !preview.verification.as_ref().is_some_and(|frame| {
             frame.width == width && frame.height == height && frame.png.as_ref() == &png
         }) {
@@ -200,7 +236,19 @@ impl SignInGuard {
         preview.set_status(SignInStatus::VerifyInApp);
         preview.png = None;
         preview.verification = None;
+        preview.wechat_channels = None;
         preview.publish_sms = Some(sms);
+    }
+
+    pub(crate) fn update_wechat_channels(&self, state: WechatChannelsPreview) {
+        let mut preview = self.entry.preview.lock().unwrap();
+        if preview.wechat_channels.as_ref() != Some(&state) {
+            // A changed choice invalidates actions sent from an earlier UI snapshot.
+            preview.set_status(SignInStatus::Loading);
+        }
+        preview.set_status(SignInStatus::VerifyInApp);
+        preview.png = None;
+        preview.wechat_channels = Some(state);
     }
 
     pub async fn verification_action(&self) -> Option<VerificationAction> {
@@ -229,5 +277,95 @@ impl Drop for SignInGuard {
         {
             active.remove(&self.account_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wechat_login_accepts_only_the_current_accounts_available_choice() {
+        let sign_ins = SignIns::default();
+        let guard = sign_ins.begin("channels-1");
+        let other = sign_ins.begin("channels-2");
+        let choice = WechatChannelsPreview::Choice {
+            nickname: "桌面账号".into(),
+        };
+        guard.update_wechat_channels(choice.clone());
+        other.update_wechat_channels(choice);
+        let current_id = || sign_ins.snapshot()["channels-1"].verification_id.unwrap();
+        let first = current_id();
+        assert!(!sign_ins.send_verification_action(
+            "channels-2",
+            first,
+            VerificationAction::WechatQuickLogin
+        ));
+        assert!(sign_ins.send_verification_action(
+            "channels-1",
+            first,
+            VerificationAction::WechatQuickLogin
+        ));
+        assert!(matches!(
+            guard.verification_action().await,
+            Some(VerificationAction::WechatQuickLogin)
+        ));
+
+        assert!(sign_ins.send_verification_action(
+            "channels-1",
+            first,
+            VerificationAction::WechatQuickLogin
+        ));
+        guard.update_wechat_channels(WechatChannelsPreview::WaitingForDesktop);
+        let waiting = current_id();
+        assert!(!sign_ins.send_verification_action(
+            "channels-1",
+            waiting,
+            VerificationAction::WechatQuickLogin
+        ));
+        assert!(sign_ins.send_verification_action(
+            "channels-1",
+            waiting,
+            VerificationAction::WechatScanLogin
+        ));
+        assert!(matches!(
+            guard.verification_action().await,
+            Some(VerificationAction::WechatScanLogin)
+        ));
+
+        guard.update_wechat_channels(WechatChannelsPreview::SelectChannel {
+            channels: vec![
+                WechatChannelChoice {
+                    nickname: "停用账号".into(),
+                    role: String::new(),
+                    available: false,
+                },
+                WechatChannelChoice {
+                    nickname: "可用账号".into(),
+                    role: "管理员".into(),
+                    available: true,
+                },
+            ],
+        });
+        let picker = current_id();
+        assert!(!sign_ins.send_verification_action(
+            "channels-1",
+            waiting,
+            VerificationAction::WechatSelectChannel { index: 1 }
+        ));
+        assert!(!sign_ins.send_verification_action(
+            "channels-1",
+            picker,
+            VerificationAction::WechatSelectChannel { index: 0 }
+        ));
+        assert!(sign_ins.send_verification_action(
+            "channels-1",
+            picker,
+            VerificationAction::WechatSelectChannel { index: 1 }
+        ));
+        assert!(matches!(
+            guard.verification_action().await,
+            Some(VerificationAction::WechatSelectChannel { index: 1 })
+        ));
     }
 }

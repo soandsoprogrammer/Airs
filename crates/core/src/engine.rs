@@ -2,11 +2,11 @@ use crate::*;
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -50,16 +50,36 @@ pub trait PlatformAdapter: Send + Sync {
     ) -> Result<SessionStatus>;
     async fn prepare(&self, ctx: RunContext) -> Result<Box<dyn Prepared>>;
 }
-struct Control {
+pub const MAX_CONCURRENT_JOBS: usize = 3;
+
+struct QueuedJob {
+    id: String,
+    account_id: String,
+}
+
+struct RunningJob {
+    account_id: String,
     cancel: CancellationToken,
     submit: Arc<Notify>,
 }
+
+#[derive(Default)]
+struct Queue {
+    pending: VecDeque<QueuedJob>,
+    running: HashMap<String, RunningJob>,
+}
+
+impl Queue {
+    fn contains(&self, id: &str) -> bool {
+        self.running.contains_key(id) || self.pending.iter().any(|job| job.id == id)
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     store: Store,
     adapters: Arc<HashMap<String, Arc<dyn PlatformAdapter>>>,
-    controls: Arc<Mutex<HashMap<String, Control>>>,
-    semaphore: Arc<Semaphore>,
+    queue: Arc<Mutex<Queue>>,
 }
 impl Engine {
     pub fn new(store: Store, adapters: Vec<(Platform, Arc<dyn PlatformAdapter>)>) -> Self {
@@ -71,8 +91,7 @@ impl Engine {
                     .map(|(p, a)| (format!("{p:?}"), a))
                     .collect(),
             ),
-            controls: Default::default(),
-            semaphore: Arc::new(Semaphore::new(1)),
+            queue: Default::default(),
         }
     }
     pub fn adapter(&self, p: Platform) -> Result<Arc<dyn PlatformAdapter>> {
@@ -82,31 +101,39 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("平台尚未接入"))
     }
     pub fn cancel_all(&self) {
-        for c in self.controls.lock().unwrap().values() {
-            c.cancel.cancel();
+        let mut queue = self.queue.lock().unwrap();
+        for job in queue.running.values() {
+            job.cancel.cancel();
+        }
+        for job in queue.pending.drain(..) {
+            let _ = self.cancel_queued(&job.id);
         }
     }
     pub fn active_count(&self) -> usize {
-        self.controls.lock().unwrap().len()
+        let queue = self.queue.lock().unwrap();
+        queue.running.len() + queue.pending.len()
     }
-    pub fn resume(&self, id: String) -> Result<()> {
-        ensure!(
-            !self.controls.lock().unwrap().contains_key(&id),
-            "任务正在执行"
-        );
-        let job = self.store.job(&id)?;
-        if matches!(job.state, JobState::Failed | JobState::Cancelled) {
-            job.content.validate()?;
-            job.content.validate_for_platform(job.account.platform)?;
-            self.store
-                .transition(&id, JobState::Queued, "用户重新准备；保留之前的执行记录")?;
-        }
-        self.start(id)
+    pub fn scheduled_jobs(&self) -> HashSet<String> {
+        let queue = self.queue.lock().unwrap();
+        queue
+            .running
+            .keys()
+            .chain(queue.pending.iter().map(|job| &job.id))
+            .cloned()
+            .collect()
     }
     pub fn cancel(&self, id: &str) -> Result<()> {
-        if let Some(c) = self.controls.lock().unwrap().get(id) {
-            c.cancel.cancel();
-        } else if self.store.job(id)?.state == JobState::Queued {
+        let mut queue = self.queue.lock().unwrap();
+        if let Some(job) = queue.running.get(id) {
+            job.cancel.cancel();
+        } else {
+            self.cancel_queued(id)?;
+            queue.pending.retain(|job| job.id != id);
+        }
+        Ok(())
+    }
+    fn cancel_queued(&self, id: &str) -> Result<()> {
+        if self.store.job(id)?.state == JobState::Queued {
             self.store
                 .transition(id, JobState::Cancelled, "排队任务已取消")?;
         }
@@ -124,9 +151,10 @@ impl Engine {
             j.state == JobState::WaitingUser && j.ready_to_submit,
             "任务尚未准备完成"
         );
-        self.controls
+        self.queue
             .lock()
             .unwrap()
+            .running
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("该任务已停止，请重新准备"))?
             .submit
@@ -134,32 +162,65 @@ impl Engine {
         Ok(())
     }
     pub fn start(&self, id: String) -> Result<()> {
-        ensure!(
-            self.store.job(&id)?.state == JobState::Queued,
-            "任务不在队列中"
-        );
-        let cancel = CancellationToken::new();
-        let submit = Arc::new(Notify::new());
-        {
-            let mut controls = self.controls.lock().unwrap();
-            ensure!(!controls.contains_key(&id), "任务已经启动");
-            controls.insert(
+        self.enqueue(id, false)
+    }
+    pub fn resume(&self, id: String) -> Result<()> {
+        self.enqueue(id, true)
+    }
+    fn enqueue(&self, id: String, retry: bool) -> Result<()> {
+        let mut queue = self.queue.lock().unwrap();
+        ensure!(!queue.contains(&id), "任务已经在队列中或正在执行");
+        let job = self.store.job(&id)?;
+        if retry && matches!(job.state, JobState::Failed | JobState::Cancelled) {
+            job.content.validate()?;
+            job.content.validate_for_platform(job.account.platform)?;
+            self.store
+                .transition(&id, JobState::Queued, "用户重新准备；保留之前的执行记录")?;
+        } else {
+            ensure!(job.state == JobState::Queued, "任务不在队列中");
+        }
+        queue.pending.push_back(QueuedJob {
+            id,
+            account_id: job.account.id,
+        });
+        self.dispatch(&mut queue);
+        Ok(())
+    }
+    fn dispatch(&self, queue: &mut Queue) {
+        while queue.running.len() < MAX_CONCURRENT_JOBS {
+            // Leave tasks for busy accounts in place while other accounts use free slots.
+            let Some(index) = queue.pending.iter().position(|pending| {
+                !queue
+                    .running
+                    .values()
+                    .any(|running| running.account_id == pending.account_id)
+            }) else {
+                break;
+            };
+            let QueuedJob { id, account_id } = queue.pending.remove(index).unwrap();
+            let cancel = CancellationToken::new();
+            let submit = Arc::new(Notify::new());
+            queue.running.insert(
                 id.clone(),
-                Control {
+                RunningJob {
+                    account_id,
                     cancel: cancel.clone(),
                     submit: submit.clone(),
                 },
             );
+            let engine = self.clone();
+            tokio::spawn(async move {
+                let _ = engine.run(&id, cancel, submit).await;
+                let mut queue = engine.queue.lock().unwrap();
+                queue.running.remove(&id);
+                engine.dispatch(&mut queue);
+            });
         }
-        let engine = self.clone();
-        tokio::spawn(async move {
-            let _ = engine.run(&id, cancel, submit).await;
-            engine.controls.lock().unwrap().remove(&id);
-        });
-        Ok(())
     }
     async fn run(&self, id: &str, cancel: CancellationToken, submit: Arc<Notify>) -> Result<()> {
-        let _permit = tokio::select! { p=self.semaphore.acquire()=>p?, _=cancel.cancelled()=>{self.store.transition(id,JobState::Cancelled,"排队任务已取消")?; return Ok(());} };
+        if cancel.is_cancelled() {
+            return self.cancel_queued(id);
+        }
         if self.store.job(id)?.state != JobState::Queued {
             return Ok(());
         }

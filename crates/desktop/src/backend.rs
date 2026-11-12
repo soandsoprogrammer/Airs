@@ -1,22 +1,27 @@
 use publisher_core::*;
 use publisher_platforms::sign_in::{SignInPreview, SignIns, VerificationAction};
 use publisher_platforms::upload_progress::{UploadProgress, UploadProgressRegistry};
-use publisher_platforms::{Douyin, Kuaishou, Xiaohongshu};
+use publisher_platforms::{Douyin, Kuaishou, WechatChannels, Xiaohongshu};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 
-pub const ACCOUNT_PLATFORMS: [Platform; 3] =
-    [Platform::Douyin, Platform::Kuaishou, Platform::Xiaohongshu];
+pub const ACCOUNT_PLATFORMS: [Platform; 4] = [
+    Platform::Douyin,
+    Platform::Kuaishou,
+    Platform::Xiaohongshu,
+    Platform::WechatChannels,
+];
 
 #[derive(Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub accounts: Vec<Account>,
     pub assets: Vec<Asset>,
     pub jobs: Vec<Job>,
+    pub scheduled_jobs: HashSet<String>,
     pub events: HashMap<String, Vec<JobEvent>>,
     pub logins: Vec<String>,
     pub sign_ins: HashMap<String, SignInPreview>,
@@ -59,6 +64,11 @@ pub enum Update {
 pub enum Command {
     AddAccount(Platform),
     Rename(String, String),
+    SaveAccountNote {
+        id: String,
+        note: String,
+        result: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     DeleteAccount(String),
     Login(String),
     CancelLogin(String),
@@ -128,6 +138,7 @@ impl Worker {
             accounts: self.accounts()?,
             assets: self.store.assets()?,
             jobs,
+            scheduled_jobs: self.engine.scheduled_jobs(),
             events,
             logins: self.logins.lock().unwrap().keys().cloned().collect(),
             sign_ins: self.sign_ins.snapshot(),
@@ -212,10 +223,12 @@ impl Worker {
         }
         let jobs = self.store.enqueue(key, &selected, content)?;
         anyhow::ensure!(!jobs.is_empty(), "该批次的任务记录已删除");
+        let scheduled = self.engine.scheduled_jobs();
         let mut startup_failed = false;
         for job in jobs {
             if job.state == JobState::Queued
                 && ACCOUNT_PLATFORMS.contains(&job.account.platform)
+                && !scheduled.contains(&job.id)
                 && self.engine.start(job.id).is_err()
             {
                 startup_failed = true;
@@ -245,6 +258,16 @@ impl Worker {
                 self.account(&id)?;
                 self.store.rename_account(&id, &alias)?;
                 Ok("显示名称已更新".into())
+            }
+            Command::SaveAccountNote { id, note, result } => {
+                let saved = self
+                    .account(&id)
+                    .and_then(|_| self.store.save_account_note(&id, &note));
+                if saved.is_ok() {
+                    let _ = self.refresh();
+                }
+                let _ = result.send(saved.map_err(|error| error.to_string()));
+                Ok(String::new())
             }
             Command::DeleteAccount(id) => {
                 self.account(&id)?;
@@ -331,6 +354,11 @@ impl Worker {
                     }
                     VerificationAction::RequestSmsCode | VerificationAction::VerifySmsCode(_) => {
                         Some("短信验证页面已变化，请查看任务状态")
+                    }
+                    VerificationAction::WechatQuickLogin
+                    | VerificationAction::WechatScanLogin
+                    | VerificationAction::WechatSelectChannel { .. } => {
+                        Some("视频号登录页面已变化，请查看当前登录选项")
                     }
                     VerificationAction::Click { .. } => None,
                 };
@@ -465,6 +493,8 @@ impl Backend {
                     Kuaishou::new(douyin.sign_ins.clone(), douyin.upload_progress.clone());
                 let xiaohongshu =
                     Xiaohongshu::new(douyin.sign_ins.clone(), douyin.upload_progress.clone());
+                let wechat_channels =
+                    WechatChannels::new(douyin.sign_ins.clone(), douyin.upload_progress.clone());
                 let worker = Worker {
                     sign_ins: douyin.sign_ins.clone(),
                     upload_progress: douyin.upload_progress.clone(),
@@ -474,6 +504,7 @@ impl Backend {
                             (Platform::Douyin, Arc::new(douyin)),
                             (Platform::Kuaishou, Arc::new(kuaishou)),
                             (Platform::Xiaohongshu, Arc::new(xiaohongshu)),
+                            (Platform::WechatChannels, Arc::new(wechat_channels)),
                         ],
                     ),
                     store,
