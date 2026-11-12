@@ -15,11 +15,16 @@ pub const NAV_HOVER: u32 = 0x222f49;
 pub const NAV_SELECTED: u32 = 0x303e65;
 pub const NAV_INK: u32 = 0xe0e6f4;
 pub const NAV_ACCENT: u32 = 0xa6afff;
+pub const UI_FONT_FAMILY: &str = if cfg!(target_os = "windows") {
+    "Segoe UI"
+} else {
+    "PingFang SC"
+};
 
 pub fn install_theme(cx: &mut App) {
     Theme::change(ThemeMode::Light, None, cx);
     Theme::update(cx, |theme| {
-        theme.font_family = "PingFang SC".into();
+        theme.font_family = UI_FONT_FAMILY.into();
         theme.font_size = px(16.);
         theme.radius = px(8.);
         theme.radius_lg = px(14.);

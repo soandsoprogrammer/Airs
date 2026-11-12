@@ -1,0 +1,58 @@
+name: Build Airs for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the Windows toolchain
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdk = Get-ChildItem -LiteralPath $sdkBin -Directory |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'x64\fxc.exe') } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if ($null -eq $sdk) { throw 'The Windows SDK shader compiler is unavailable.' }
+          "GPUI_FXC_PATH=$(Join-Path $sdk.FullName 'x64\fxc.exe')" >> $env:GITHUB_ENV
+
+      - name: Run Windows tests
+        run: cargo test --locked --release --workspace --target x86_64-pc-windows-msvc
+
+      - name: Build Airs
+        run: cargo build --locked --release -p social-publisher --target x86_64-pc-windows-msvc
+
+      - name: Package and smoke-test Airs
+        shell: pwsh
+        run: |
+          $package = New-Item -ItemType Directory -Force -Path 'dist/Airs-windows-x64'
+          $app = Join-Path $package.FullName 'Airs.exe'
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/social-publisher.exe' $app
+          Copy-Item -Path 'README.md','docs/SAU-LICENSE.txt' -Destination $package.FullName
+          $smokeLog = Join-Path $env:RUNNER_TEMP 'airs-browser-smoke.log'
+          $smoke = Start-Process -FilePath $app -ArgumentList '--browser-smoke' -RedirectStandardError $smokeLog -PassThru -Wait
+          if ($smoke.ExitCode -ne 0) {
+            Get-Content -LiteralPath $smokeLog
+            throw "Airs browser smoke test failed ($($smoke.ExitCode))."
+          }
+
+      - name: Upload the portable package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Airs-windows-x64
+          path: dist/Airs-windows-x64/
+          if-no-files-found: error

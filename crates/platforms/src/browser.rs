@@ -10,10 +10,50 @@ use tokio::task::JoinHandle;
 pub fn chrome_path() -> PathBuf {
     std::env::var_os("PUBLISHER_CHROME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-        })
+        .unwrap_or_else(default_chrome_path)
 }
+
+#[cfg(not(target_os = "windows"))]
+fn default_chrome_path() -> PathBuf {
+    PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+}
+
+#[cfg(target_os = "windows")]
+fn default_chrome_path() -> PathBuf {
+    use chromiumoxide::detection::{DetectionOptions, default_executable};
+
+    if let Ok(path) = default_executable(DetectionOptions {
+        msedge: false,
+        unstable: false,
+    }) && path.is_file()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("chrome.exe"))
+    {
+        return path;
+    }
+
+    const INSTALL_PATH: &str = r"Google\Chrome\Application\chrome.exe";
+    [
+        "ProgramW6432",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "LOCALAPPDATA",
+    ]
+    .into_iter()
+    .filter_map(std::env::var_os)
+    .filter(|directory| !directory.is_empty())
+    .map(PathBuf::from)
+    .chain([
+        PathBuf::from(r"C:\Program Files"),
+        PathBuf::from(r"C:\Program Files (x86)"),
+    ])
+    .map(|directory| directory.join(INSTALL_PATH))
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| PathBuf::from(r"C:\Program Files").join(INSTALL_PATH))
+}
+
 pub struct BrowserSession {
     pub browser: Browser,
     handler: JoinHandle<()>,

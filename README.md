@@ -4,7 +4,7 @@ Airs 是面向自媒体创作者的 macOS 多平台发布工具，可统一管�
 
 Native macOS social media publisher for Douyin, Kuaishou, Xiaohongshu (RedNote), and WeChat Channels, built with Rust and GPUI Kit.
 
-当前为 macOS Apple 芯片开发版，采用 Rust 原生界面。抖音、快手和视频号的视频流程已用真实账号验证并收到平台接收回执。图文和小红书的真实账号发布仍待验收。
+已验证的桌面开发版运行在 Apple 芯片 Mac 上，采用 Rust 原生界面。抖音、快手和视频号的视频流程已用真实账号验证并收到平台接收回执。图文和小红书的真实账号发布仍待验收。
 
 平台的登录与发布流程参考 [social-auto-upload 的固定版本](docs/upstream.md)，由 Rust 适配器执行。
 
@@ -23,6 +23,12 @@ cargo run --locked -p social-publisher
 ```
 
 随后打开 `target/package/Airs.app`。这是本机开发版，使用临时本地签名；尚未进行开发者签名、公证、安装包或干净设备验收。应用放在构建目录中，避免同步文件夹对应用包附加元数据导致签名校验失败。
+
+## Windows x64 构建
+
+在 GitHub 的 **Actions → Build Airs for Windows** 中选择 **Run workflow**。工作流需要先出现在仓库默认分支。构建通过后，在运行详情的 **Artifacts** 下载 `Airs-windows-x64`，解压并打开 `Airs.exe`。
+
+发布功能需要本机安装 Chrome。Windows 会自动查找标准安装位置，也可在设置中指定 `chrome.exe`。应用内视频播放目前由 macOS 提供。
 
 ## 使用流程
 

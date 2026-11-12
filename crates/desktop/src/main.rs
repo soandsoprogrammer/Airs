@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod accounts;
 mod appearance;
 mod backend;
@@ -2495,7 +2500,7 @@ impl Render for Publisher {
 
         h_flex()
             .size_full()
-            .font_family("PingFang SC")
+            .font_family(UI_FONT_FAMILY)
             .text_size(px(14.))
             .bg(rgb(CANVAS))
             .text_color(rgb(INK))
@@ -2523,7 +2528,12 @@ fn main() -> anyhow::Result<()> {
         .run(move |cx| {
             gpui_kit::init(cx);
             install_theme(cx);
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            let quit_shortcut = if cfg!(target_os = "macos") {
+                "cmd-q"
+            } else {
+                "ctrl-q"
+            };
+            cx.bind_keys([KeyBinding::new(quit_shortcut, Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.set_menus(vec![Menu {
                 name: PRODUCT_NAME.into(),
