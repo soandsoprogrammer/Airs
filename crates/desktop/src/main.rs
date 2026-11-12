@@ -77,17 +77,6 @@ impl Page {
             Self::Settings => AppIcon::Settings,
         }
     }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::Overview => "查看账号、素材和发布任务。",
-            Self::Accounts => "按平台筛选账号，点击卡片查看详情。",
-            Self::Assets => "导入和预览本地视频与图片。",
-            Self::Compose => "选择账号和素材，填写作品内容。",
-            Self::Jobs => "跟踪准备进度，查看任务记录。",
-            Self::Settings => "管理后台浏览器，查看任务队列规则。",
-        }
-    }
 }
 struct Publisher {
     backend: Backend,
@@ -2166,31 +2155,11 @@ impl Render for Publisher {
             || ElementId::from(("page-scroll", self.page as usize)),
             |details| eid("account-detail-scroll", &details.id),
         );
-        let subtitle = if account_details.is_some() {
-            "查看登录状态和账号资料。"
-        } else {
-            self.page.subtitle()
-        };
         let photo_gallery = self.photo_gallery(window, cx);
         let previewing_photos = photo_gallery.is_some();
         let body = photo_gallery.map_or_else(|| self.body(window, cx), Div::into_any_element);
         let publish_sms = self.publish_sms_panel(window, cx);
-        let mut workspace = v_flex().flex_1().h_full().min_w_0().child(
-            v_flex()
-                .gap_1()
-                .px_7()
-                .py_5()
-                .border_b_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(SURFACE))
-                .child(
-                    div()
-                        .text_size(px(26.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(self.page.title()),
-                )
-                .child(div().text_sm().text_color(rgb(MUTED)).child(subtitle)),
-        );
+        let mut workspace = v_flex().flex_1().h_full().min_w_0();
         if let Some(publish_sms) = publish_sms {
             workspace = workspace.child(publish_sms);
         }
