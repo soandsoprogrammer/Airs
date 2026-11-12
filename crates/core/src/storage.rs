@@ -50,6 +50,7 @@ impl Store {
         connection.execute_batch(include_str!("../../../migrations/001_initial.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/002_removed_accounts.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/003_removed_jobs.sql"))?;
+        connection.execute_batch(include_str!("../../../migrations/004_material_sets.sql"))?;
         Ok(s)
     }
     fn conn(&self) -> Result<Connection> {
@@ -234,18 +235,60 @@ impl Store {
         self.insert_asset(Asset::inspect_images(paths)?)
     }
     fn insert_asset(&self, a: Asset) -> Result<Asset> {
-        self.conn()?.execute(
-            "INSERT INTO assets VALUES(?1,?2)",
-            params![a.id, serde_json::to_string(&a)?],
-        )?;
+        Self::insert_asset_row(&self.conn()?, &a)?;
         Ok(a)
+    }
+    fn insert_asset_row(connection: &Connection, asset: &Asset) -> Result<()> {
+        connection.execute(
+            "INSERT INTO assets VALUES(?1,?2)",
+            params![asset.id, serde_json::to_string(asset)?],
+        )?;
+        Ok(())
     }
     pub fn assets(&self) -> Result<Vec<Asset>> {
         self.list_json("SELECT data FROM assets ORDER BY rowid DESC")
     }
+    pub fn import_material_set(&self, paths: &[PathBuf]) -> Result<MaterialSet> {
+        let material = MaterialSet::inspect(paths)?;
+        let mut connection = self.conn()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO material_sets VALUES(?1,?2)",
+            params![material.id, serde_json::to_string(&material)?],
+        )?;
+        for asset in material.assets() {
+            Self::insert_asset_row(&tx, asset)?;
+            tx.execute(
+                "INSERT INTO material_set_assets VALUES(?1,?2)",
+                params![asset.id, material.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(material)
+    }
+    pub fn material_sets(&self) -> Result<Vec<MaterialSet>> {
+        let mut connection = self.conn()?;
+        let tx = connection.transaction()?;
+        let mut materials =
+            Self::read_json(&tx, "SELECT data FROM material_sets ORDER BY rowid DESC")?;
+        let legacy: Vec<Asset> = Self::read_json(
+            &tx,
+            "SELECT data FROM assets WHERE NOT EXISTS (
+                SELECT 1 FROM material_set_assets WHERE asset_id=assets.id
+            ) ORDER BY rowid DESC",
+        )?;
+        materials.extend(legacy.into_iter().map(MaterialSet::from_legacy));
+        tx.commit()?;
+        Ok(materials)
+    }
     fn list_json<T: serde::de::DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>> {
-        let c = self.conn()?;
-        let mut st = c.prepare(sql)?;
+        Self::read_json(&self.conn()?, sql)
+    }
+    fn read_json<T: serde::de::DeserializeOwned>(
+        connection: &Connection,
+        sql: &str,
+    ) -> Result<Vec<T>> {
+        let mut st = connection.prepare(sql)?;
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }

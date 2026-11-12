@@ -30,7 +30,7 @@ const SMS_PANEL: &str = r#"async (origin, action) => {
     !element.closest(':disabled, [disabled], [aria-disabled="true"], .disabled') &&
     getComputedStyle(element).pointerEvents !== 'none';
   const label = (element) => (element?.innerText ?? '').trim();
-  const requestLabel = /^(获取验证码|重新获取(?:验证码)?)$/;
+  const requestLabel = /^(获取验证码|重新获取(?:验证码)?|重新发送)$/;
   const verifyLabel = /^(验证|确认验证)$/;
   const codeInput = 'input[placeholder*="验证码"]';
   const requestCode = '.uc-ui-verify_sms-verify_input .uc-ui-input_right';
@@ -383,12 +383,36 @@ mod tests {
             forward_sms_action(&page, &origin, None, request).await,
             Some("暂时无法请求验证码，请稍后再试。")
         );
+        page.evaluate_expression("document.querySelector('#get span').textContent = '重新发送'")
+            .await?;
+        let native = sms_panel(&page, &origin)
+            .await
+            .and_then(|panel| panel.native);
+        assert_eq!(
+            native,
+            Some(PublishSmsPreview {
+                can_request_code: true,
+                can_verify: true,
+                resend_seconds: None,
+            })
+        );
+        assert!(truth(&page, "window.codeRequests === 1").await?);
+        assert_eq!(
+            forward_sms_action(&page, &origin, None, VerificationAction::RequestSmsCode).await,
+            Some("已向抖音请求短信验证码。")
+        );
+        assert!(
+            sms_panel(&page, &origin)
+                .await
+                .and_then(|panel| panel.native)
+                .is_some_and(|sms| !sms.can_request_code && sms.resend_seconds == Some(59))
+        );
         let verify = VerificationAction::VerifySmsCode("123456".into());
         assert_eq!(
             forward_sms_action(&page, &origin, None, verify).await,
             Some("已向抖音提交验证码，正在等待平台结果。")
         );
-        assert!(truth(&page, "window.codeRequests === 1 && window.verifications === 1 && window.confirmed === '123456'").await?);
+        assert!(truth(&page, "window.codeRequests === 2 && window.verifications === 1 && window.confirmed === '123456'").await?);
         page.evaluate_expression(
             "(() => { const error = document.querySelector('.uc-ui-verify_error'); error.hidden = false; error.textContent = '验证码不正确：123456'; })()",
         )
@@ -414,6 +438,12 @@ mod tests {
                 .await
                 .is_some_and(|panel| panel.native.is_none())
         );
+        page.evaluate_expression("document.querySelector('#get span').textContent = '重新发送'")
+            .await?;
+        assert_eq!(
+            forward_sms_action(&page, &origin, Some(viewport), click(100.)).await,
+            None
+        );
         assert_eq!(
             forward_sms_action(&page, &origin, Some(viewport), click(42.)).await,
             None
@@ -426,7 +456,7 @@ mod tests {
         assert!(
             truth(
                 &page,
-                "window.codeRequests === 1 && window.verifications === 1 && document.querySelector('#code').value === '654321'"
+                "window.codeRequests === 3 && window.verifications === 1 && document.querySelector('#code').value === '654321'"
             )
             .await?
         );

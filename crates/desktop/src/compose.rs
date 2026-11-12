@@ -1,5 +1,5 @@
 use super::*;
-use crate::accounts::platform_icon;
+use crate::{accounts::platform_icon, materials::material_summary};
 use gpui_kit::component::input::Textarea;
 use publisher_core::Asset;
 
@@ -89,11 +89,7 @@ impl Publisher {
                                     })
                                     .on_click(cx.listener(move |s, _, _, cx| {
                                         if s.compose_media_kind != choice {
-                                            s.compose_media_kind = choice;
-                                            s.selected_asset = None;
-                                            s.compose_image_order.clear();
-                                            s.compose_asset_picker_open = false;
-                                            s.reset_compose_batch();
+                                            s.switch_compose_kind(choice);
                                             cx.notify();
                                         }
                                     }))
@@ -277,29 +273,25 @@ impl Publisher {
     fn compose_media(&self, cx: &mut Context<Self>) -> Div {
         let kind = self.compose_media_kind;
         let picked = self.compose_ordered_asset();
-        let available = self
-            .snapshot
-            .assets
-            .iter()
-            .filter(|asset| asset.kind == kind);
-        let has_assets = available.clone().next().is_some();
-        let (heading, import_label, empty_label, empty_hint) = match kind {
-            MediaKind::Video => (
-                "视频素材",
-                "导入视频",
-                "未选择视频",
-                "支持 MP4、MOV、M4V 和 WebM。",
-            ),
-            MediaKind::Images => (
-                "图文素材",
-                "导入图片",
-                "未选择图片",
-                "可一次选择多张 JPG、PNG 或 WebP 图片。",
-            ),
+        let selected_set = self
+            .selected_material_set
+            .as_deref()
+            .and_then(|id| self.snapshot.material_sets.iter().find(|set| set.id == id));
+        let has_sets = !self.snapshot.material_sets.is_empty();
+        let (heading, empty_label) = match kind {
+            MediaKind::Video => ("视频素材", "未选择视频"),
+            MediaKind::Images => ("图文素材", "未选择图片"),
         };
+        let empty_hint = match (selected_set, kind) {
+            (Some(set), _) if set.assets().next().is_none() => "这个素材集只包含文案。",
+            (Some(_), MediaKind::Video) => "这个素材集没有视频。",
+            (Some(_), MediaKind::Images) => "这个素材集没有图片。",
+            (None, _) => "可从素材库选择，也可导入本地文件。",
+        };
+        let selected_title = selected_set.map(|set| set.title.clone());
         let browse_label = if self.compose_asset_picker_open {
             "收起素材库"
-        } else if picked.is_some() {
+        } else if selected_set.is_some() {
             "更换素材"
         } else {
             "选择素材"
@@ -316,12 +308,12 @@ impl Publisher {
                         .child(
                             Button::new("compose-import-media")
                                 .small()
-                                .when(has_assets, |button| button.ghost())
+                                .when(has_sets, |button| button.ghost())
                                 .icon(AppIcon::Plus)
-                                .label(import_label)
-                                .on_click(cx.listener(move |s, _, _, cx| s.pick_media(kind, cx))),
+                                .label("导入素材")
+                                .on_click(cx.listener(|s, _, _, cx| s.pick_materials(cx))),
                         )
-                        .when(has_assets, |actions| {
+                        .when(has_sets, |actions| {
                             actions.child(
                                 Button::new("compose-toggle-library")
                                     .small()
@@ -336,16 +328,32 @@ impl Publisher {
                 ),
         );
         panel = panel.child(if let Some(asset) = picked.as_ref() {
-            h_flex()
-                .justify_between()
-                .gap_3()
+            v_flex()
+                .gap_2()
                 .p_3()
                 .rounded(px(10.))
                 .border_1()
                 .border_color(rgb(BORDER))
                 .bg(rgb(CANVAS))
-                .child(asset_label(asset).flex_1())
-                .child(self.preview_button(asset, cx))
+                .when_some(
+                    selected_title.filter(|title| title != &asset_name(asset)),
+                    |card, title| {
+                        card.child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(title),
+                        )
+                    },
+                )
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap_3()
+                        .child(asset_label(asset).flex_1())
+                        .child(self.preview_button(asset, cx)),
+                )
         } else {
             h_flex()
                 .gap_3()
@@ -355,32 +363,28 @@ impl Publisher {
                 .child(icon_tile(media_icon(kind), 36., ACCENT, ACCENT_WASH))
                 .child(
                     v_flex()
+                        .min_w_0()
                         .gap_1()
                         .child(field_title(empty_label))
+                        .when_some(selected_title, |details, title| {
+                            details.child(div().truncate().text_sm().child(title))
+                        })
                         .child(muted_text(empty_hint)),
                 )
         });
-        if self.compose_asset_picker_open && has_assets {
+        if self.compose_asset_picker_open && has_sets {
             panel = panel.child(
                 v_flex()
                     .id("compose-media-options")
-                    .max_h(px(188.))
+                    .max_h(px(260.))
                     .overflow_y_scroll()
                     .gap_2()
-                    .children(available.map(|asset| {
-                        let id = asset.id.clone();
-                        let selected = self.selected_asset.as_ref() == Some(&id);
-                        compose_choice(eid("compose-asset", &id), selected)
-                            .h(px(52.))
-                            .accessibility_label(format!("选择素材 {}", asset_name(asset)))
-                            .tooltip(asset.path.to_string_lossy().into_owned())
-                            .child(asset_label(asset).flex_1())
-                            .when(selected, |button| button.icon(AppIcon::Check))
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.select_compose_asset(id.clone());
-                                cx.notify();
-                            }))
-                    })),
+                    .children(
+                        self.snapshot
+                            .material_sets
+                            .iter()
+                            .map(|set| self.compose_material_option(set, cx)),
+                    ),
             );
         }
         if let Some(asset) = picked.filter(|asset| asset.kind == MediaKind::Images) {
@@ -392,6 +396,59 @@ impl Publisher {
             );
         }
         panel
+    }
+
+    fn compose_material_option(&self, set: &MaterialSet, cx: &mut Context<Self>) -> Div {
+        let selected = self.selected_material_set.as_deref() == Some(set.id.as_str());
+        let label = set.title.clone();
+        let details = material_summary(set);
+        let set_id = set.id.clone();
+        let heading = compose_choice(eid("compose-material-set", &set.id), selected)
+            .h(px(52.))
+            .accessibility_label(format!("使用素材集 {label}，{details}"))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .child(icon_tile(AppIcon::FolderOpen, 30., ACCENT, ACCENT_WASH))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(label),
+                            )
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(details)),
+                    ),
+            )
+            .when(selected, |button| button.icon(AppIcon::Check))
+            .on_click(cx.listener(move |s, _, window, cx| {
+                s.use_material_set(&set_id, None, window, cx);
+            }));
+        v_flex()
+            .gap_1()
+            .child(heading)
+            .when(set.assets().count() > 1, |group| {
+                group.child(v_flex().pl_3().gap_1().children(set.assets().map(|asset| {
+                    let asset_id = asset.id.clone();
+                    let set_id = set.id.clone();
+                    let selected = self.selected_asset.as_deref() == Some(asset_id.as_str());
+                    compose_choice(eid("compose-asset", &asset.id), selected)
+                        .h(px(44.))
+                        .accessibility_label(format!("选择素材 {}", asset_name(asset)))
+                        .tooltip(asset.path.to_string_lossy().into_owned())
+                        .child(asset_label(asset).flex_1())
+                        .when(selected, |button| button.icon(AppIcon::Check))
+                        .on_click(cx.listener(move |s, _, window, cx| {
+                            s.use_material_set(&set_id, Some(&asset_id), window, cx);
+                        }))
+                })))
+            })
     }
 
     fn compose_image_sequence(&self, asset: &Asset, cx: &mut Context<Self>) -> impl IntoElement {
@@ -760,18 +817,137 @@ impl Publisher {
 
     pub(super) fn compose_selected_asset(&self) -> Option<&Asset> {
         let id = self.selected_asset.as_ref()?;
-        self.snapshot.assets.iter().find(|asset| &asset.id == id)
+        self.snapshot
+            .material_sets
+            .iter()
+            .filter(|set| {
+                self.selected_material_set
+                    .as_ref()
+                    .is_none_or(|id| &set.id == id)
+            })
+            .flat_map(MaterialSet::assets)
+            .find(|asset| &asset.id == id)
     }
 
     pub(super) fn select_compose_asset(&mut self, id: String) {
         self.compose_asset_picker_open = false;
-        if self.selected_asset.as_ref() != Some(&id)
-            && let Some(asset) = self.snapshot.assets.iter().find(|asset| asset.id == id)
-        {
+        if let Some((set, asset)) = self.snapshot.material_sets.iter().find_map(|set| {
+            set.assets()
+                .find(|asset| asset.id == id)
+                .map(|asset| (set, asset))
+        }) {
+            let same_set = self.selected_material_set.as_ref() == Some(&set.id);
+            self.selected_material_set = Some(set.id.clone());
+            if self.selected_asset.as_ref() == Some(&id) {
+                return;
+            }
             self.compose_media_kind = asset.kind;
-            self.compose_image_order = (0..asset.images.len()).collect();
+            if !same_set
+                || (asset.kind == MediaKind::Images
+                    && self.compose_image_order.len() != asset.images.len())
+            {
+                self.compose_image_order = (0..asset.images.len()).collect();
+            }
             self.selected_asset = Some(id);
             self.reset_compose_batch();
+        }
+    }
+
+    fn switch_compose_kind(&mut self, kind: MediaKind) {
+        let asset_id = self.selected_material_set.as_deref().and_then(|id| {
+            self.snapshot
+                .material_sets
+                .iter()
+                .find(|set| set.id == id)?
+                .assets()
+                .find(|asset| asset.kind == kind)
+                .map(|asset| asset.id.clone())
+        });
+        self.compose_media_kind = kind;
+        if let Some(asset_id) = asset_id {
+            self.select_compose_asset(asset_id);
+        } else {
+            self.selected_asset = None;
+            self.compose_asset_picker_open = false;
+            self.reset_compose_batch();
+        }
+    }
+
+    pub(super) fn use_material_set(
+        &mut self,
+        set_id: &str,
+        asset_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(set) = self
+            .snapshot
+            .material_sets
+            .iter()
+            .find(|set| set.id == set_id)
+        else {
+            return;
+        };
+        let asset = if let Some(id) = asset_id {
+            let Some(asset) = set.assets().find(|asset| asset.id == id) else {
+                return;
+            };
+            Some(asset)
+        } else {
+            let current = self.selected_asset.as_deref();
+            set.assets()
+                .find(|asset| Some(asset.id.as_str()) == current)
+                .or_else(|| {
+                    set.assets()
+                        .find(|asset| asset.kind == self.compose_media_kind)
+                })
+                .or_else(|| set.videos.first())
+                .or(set.images.as_ref())
+        };
+        let asset_id = asset.map(|asset| asset.id.clone());
+        let title = set.title.clone();
+        let description = set.description.clone();
+        if let Some(asset_id) = asset_id {
+            self.select_compose_asset(asset_id);
+        } else {
+            self.selected_material_set = Some(set_id.to_owned());
+            if self.selected_asset.take().is_some() {
+                self.reset_compose_batch();
+            }
+            self.compose_image_order.clear();
+            self.compose_asset_picker_open = false;
+        }
+        self.fill_material_text(title, description, window, cx);
+        cx.notify();
+    }
+
+    fn fill_material_text(
+        &mut self,
+        title: String,
+        description: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_title = self.title.read(cx).value();
+        let current_description = self.description.read(cx).value();
+        let fill_title = current_title.trim().is_empty()
+            || self.material_autofill[0].as_deref() == Some(current_title.as_str());
+        let fill_description = current_description.trim().is_empty()
+            || self.material_autofill[1].as_deref() == Some(current_description.as_str());
+        let title_changed = fill_title && current_title.as_str() != title;
+        let description_changed = fill_description && current_description.as_str() != description;
+        if title_changed || description_changed {
+            self.reset_compose_batch();
+        }
+        self.material_autofill[0] = fill_title.then(|| title.clone());
+        if title_changed {
+            self.title
+                .update(cx, |input, cx| input.set_value(title, window, cx));
+        }
+        self.material_autofill[1] = fill_description.then(|| description.clone());
+        if description_changed {
+            self.description
+                .update(cx, |input, cx| input.set_value(description, window, cx));
         }
     }
 
@@ -781,8 +957,8 @@ impl Publisher {
             asset.images = self
                 .compose_image_order
                 .iter()
-                .map(|&index| asset.images[index].clone())
-                .collect();
+                .map(|&index| asset.images.get(index).cloned())
+                .collect::<Option<Vec<_>>>()?;
             let first = asset.images.first()?;
             asset.path = first.path.clone();
             asset.modified_ms = first.modified_ms;
@@ -797,6 +973,18 @@ impl Publisher {
 
     pub(super) fn compose_input_changed(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
         if matches!(event, InputEvent::Change) {
+            let current = [
+                self.title.read(cx).value(),
+                self.description.read(cx).value(),
+            ];
+            for (previous, current) in self.material_autofill.iter_mut().zip(current) {
+                if previous
+                    .as_deref()
+                    .is_some_and(|value| value != current.as_str())
+                {
+                    *previous = None;
+                }
+            }
             if self.queued || self.pending_batch.as_ref() == Some(&self.batch_key) {
                 self.reset_compose_batch();
             }
@@ -808,6 +996,15 @@ impl Publisher {
         if let Some(draft) = self.snapshot.draft.clone() {
             let content_changed = self.content(cx).as_ref() != Some(&draft);
             self.select_compose_asset(draft.asset.id.clone());
+            if self
+                .compose_selected_asset()
+                .is_none_or(|asset| asset.id != draft.asset.id)
+            {
+                self.message = "草稿里的素材已不可用，请重新选择素材。".into();
+                cx.notify();
+                return;
+            }
+            self.material_autofill = Default::default();
             self.douyin_video_covers = draft.douyin_video_covers;
             if draft.asset.kind == MediaKind::Images
                 && let Some(asset) = self.compose_selected_asset()

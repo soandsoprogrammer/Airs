@@ -19,7 +19,7 @@ pub const ACCOUNT_PLATFORMS: [Platform; 4] = [
 #[derive(Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub accounts: Vec<Account>,
-    pub assets: Vec<Asset>,
+    pub material_sets: Vec<MaterialSet>,
     pub jobs: Vec<Job>,
     pub scheduled_jobs: HashSet<String>,
     pub events: HashMap<String, Vec<JobEvent>>,
@@ -55,7 +55,7 @@ pub enum Update {
     Snapshot(Box<Snapshot>),
     Message(String),
     AccountAdded(String),
-    ComposeAssetImported(String, MediaKind),
+    ComposeMaterialImported(String),
     BatchEnqueueResult {
         key: String,
         result: Result<(), String>,
@@ -76,7 +76,6 @@ pub enum Command {
     VerificationInput(String, u64, VerificationAction),
     Import {
         paths: Vec<PathBuf>,
-        kind: MediaKind,
         select_for_compose: bool,
     },
     Enqueue {
@@ -136,7 +135,7 @@ impl Worker {
             .collect();
         let snap = Snapshot {
             accounts: self.accounts()?,
-            assets: self.store.assets()?,
+            material_sets: self.store.material_sets()?,
             jobs,
             scheduled_jobs: self.engine.scheduled_jobs(),
             events,
@@ -372,17 +371,9 @@ impl Worker {
             }
             Command::Import {
                 paths,
-                kind,
                 select_for_compose,
             } => {
-                let asset = match kind {
-                    MediaKind::Video => self.store.add_asset(
-                        paths
-                            .first()
-                            .ok_or_else(|| anyhow::anyhow!("请选择一个视频"))?,
-                    )?,
-                    MediaKind::Images => self.store.add_image_asset(&paths)?,
-                };
+                let material = self.store.import_material_set(&paths)?;
                 let success = "素材已导入，保留原文件引用";
                 if !select_for_compose {
                     return Ok(success.into());
@@ -390,7 +381,7 @@ impl Worker {
                 let message = if self.refresh().is_ok() {
                     let _ = self
                         .updates
-                        .send(Update::ComposeAssetImported(asset.id, kind));
+                        .send(Update::ComposeMaterialImported(material.id));
                     success
                 } else {
                     "素材已导入，暂时无法读取素材列表"

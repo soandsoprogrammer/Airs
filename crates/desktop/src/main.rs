@@ -2,13 +2,14 @@ mod accounts;
 mod appearance;
 mod backend;
 mod compose;
+mod materials;
 mod video_preview;
 extern crate gpui_kit as gpui;
 use accounts::AccountDetails;
 use appearance::surface;
 use appearance::*;
 use backend::*;
-use compose::{asset_format, asset_name, media_icon};
+use compose::media_icon;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     assets::{AllAssets, IconName as AppIcon},
@@ -107,6 +108,9 @@ struct Publisher {
     tags: Entity<InputState>,
     browser: Entity<InputState>,
     selected_accounts: HashSet<String>,
+    material_details: Option<String>,
+    selected_material_set: Option<String>,
+    material_autofill: [Option<String>; 2],
     selected_asset: Option<String>,
     compose_media_kind: MediaKind,
     compose_image_order: Vec<usize>,
@@ -204,13 +208,13 @@ fn creator_management_label(platform: Platform) -> String {
 
 impl Publisher {
     fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
                     .await;
                 if this
-                    .update(cx, |s, cx| {
+                    .update_in(cx, |s, window, cx| {
                         while let Ok(u) = s.backend.rx.try_recv() {
                             match u {
                                 Update::Snapshot(data) if *data != s.snapshot => {
@@ -225,11 +229,8 @@ impl Publisher {
                                     s.open_account(id);
                                     cx.notify();
                                 }
-                                Update::ComposeAssetImported(id, kind)
-                                    if s.page == Page::Compose && s.compose_media_kind == kind =>
-                                {
-                                    s.select_compose_asset(id);
-                                    cx.notify();
+                                Update::ComposeMaterialImported(id) if s.page == Page::Compose => {
+                                    s.use_material_set(&id, None, window, cx);
                                 }
                                 Update::BatchEnqueueResult { key, result } => {
                                     s.finish_compose_batch(key, result);
@@ -269,6 +270,9 @@ impl Publisher {
             tags: input("用空格分隔，最多 5 个标签", cx),
             browser: input("Chrome 可执行程序的完整路径", cx),
             selected_accounts: HashSet::new(),
+            material_details: None,
+            selected_material_set: None,
+            material_autofill: Default::default(),
             selected_asset: None,
             compose_media_kind: MediaKind::Video,
             compose_image_order: Vec::new(),
@@ -313,6 +317,7 @@ impl Publisher {
         self.page = page;
         self.photo_preview = None;
         self.account_details = None;
+        self.material_details = None;
         self.job_account_filter = None;
     }
 
@@ -1084,19 +1089,13 @@ impl Publisher {
         })
     }
 
-    fn pick_media(&mut self, kind: MediaKind, cx: &mut Context<Self>) {
+    fn pick_materials(&mut self, cx: &mut Context<Self>) {
         let select_for_compose = self.page == Page::Compose;
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: kind == MediaKind::Images,
-            prompt: Some(
-                match kind {
-                    MediaKind::Video => "选择本地视频",
-                    MediaKind::Images => "选择本地图文图片",
-                }
-                .into(),
-            ),
+            multiple: true,
+            prompt: Some("导入素材".into()),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = prompt.await
@@ -1105,7 +1104,6 @@ impl Publisher {
                 let _ = this.update(cx, |s, _| {
                     s.backend.send(Command::Import {
                         paths,
-                        kind,
                         select_for_compose,
                     });
                 });
@@ -1289,7 +1287,7 @@ impl Publisher {
         let verified_accounts = publishing_accounts
             .filter(|account| account.session == SessionStatus::Ready)
             .count();
-        let asset_count = self.snapshot.assets.len();
+        let asset_count = self.snapshot.material_sets.len();
         let needs_attention = |job: &Job| {
             matches!(
                 job.state,
@@ -1329,7 +1327,7 @@ impl Publisher {
         } else if asset_count == 0 {
             (
                 "导入要发布的素材",
-                "从本机选择视频或图片，再填写作品内容。",
+                "一次选择文本、视频和图片，组成一个素材集。",
                 "打开素材库",
                 AppIcon::FolderOpen,
                 Page::Assets,
@@ -1539,7 +1537,7 @@ impl Publisher {
                 ACCENT_WASH,
             ))
             .child(metric(
-                "本地素材",
+                "素材集",
                 asset_count.to_string(),
                 AppIcon::FolderOpen,
                 0x16775c,
@@ -1618,141 +1616,7 @@ impl Publisher {
         match self.page {
             Page::Overview => self.overview(window, cx),
             Page::Accounts => self.accounts(window, cx),
-            Page::Assets => {
-                let toolbar = surface().p_4().child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_4()
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .child(icon_tile(AppIcon::FolderOpen, 38., ACCENT, ACCENT_WASH))
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .gap_1()
-                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(
-                                            format!("{} 组素材", self.snapshot.assets.len()),
-                                        ))
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(rgb(MUTED))
-                                                .child("文件保留在原位置，执行前会检查变化。"),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("import-video")
-                                        .primary()
-                                        .icon(media_icon(MediaKind::Video))
-                                        .label("导入视频")
-                                        .on_click(cx.listener(|s, _, _, cx| {
-                                            s.pick_media(MediaKind::Video, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("import-photos")
-                                        .icon(media_icon(MediaKind::Images))
-                                        .label("导入图片")
-                                        .on_click(cx.listener(|s, _, _, cx| {
-                                            s.pick_media(MediaKind::Images, cx)
-                                        })),
-                                ),
-                        ),
-                );
-                let mut library = surface().gap_0().p_0();
-                if self.snapshot.assets.is_empty() {
-                    library = library.child(
-                        h_flex()
-                            .gap_3()
-                            .p_5()
-                            .child(icon_tile(AppIcon::Clapperboard, 40., MUTED, CANVAS))
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child("还没有导入素材"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(MUTED))
-                                            .child("支持常见视频格式与 JPG、PNG、WebP 图片。"),
-                                    ),
-                            ),
-                    );
-                }
-                for (index, a) in self.snapshot.assets.clone().into_iter().enumerate() {
-                    let id = a.id.clone();
-                    let name = asset_name(&a);
-                    let path = a.path.to_string_lossy().into_owned();
-                    let format = asset_format(&a);
-                    library = library.child(
-                        h_flex()
-                            .gap_3()
-                            .px_4()
-                            .py_3()
-                            .when(index > 0, |row| row.border_t_1().border_color(rgb(BORDER)))
-                            .child(icon_tile(media_icon(a.kind), 38., ACCENT, ACCENT_WASH))
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(name),
-                                    )
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_sm()
-                                            .text_color(rgb(MUTED))
-                                            .child(path.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(CANVAS))
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .flex_shrink_0()
-                                    .child(format!(
-                                        "{format} · {:.1} MB",
-                                        a.size as f64 / 1_000_000.
-                                    )),
-                            )
-                            .child(self.preview_button(&a, cx))
-                            .child(
-                                Button::new(eid("use", &a.id))
-                                    .label("用于新建发布")
-                                    .tooltip(path)
-                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                        s.select_compose_asset(id.clone());
-                                        s.page = Page::Compose;
-                                        cx.notify();
-                                    })),
-                            ),
-                    );
-                }
-                v_flex()
-                    .gap_3()
-                    .child(toolbar)
-                    .child(library)
-                    .into_any_element()
-            }
+            Page::Assets => self.material_library(cx).into_any_element(),
             Page::Compose => self.compose(window, cx),
             Page::Jobs => {
                 let jobs: Vec<_> = self
@@ -2556,6 +2420,10 @@ impl Render for Publisher {
                 .account_details
                 .as_ref()
                 .map(|details| eid("account-detail-scroll", &details.id)),
+            Page::Assets => self
+                .material_details
+                .as_ref()
+                .map(|id| eid("material-detail-scroll", id)),
             Page::Jobs => self
                 .job_account_filter
                 .as_ref()
