@@ -22,7 +22,7 @@ impl Publisher {
                     .child(format!("{} 个素材集", sets.len())),
             )
             .child(
-                Button::new("import-materials")
+                material_action(Button::new("import-materials"))
                     .primary()
                     .icon(AppIcon::Plus)
                     .label("导入素材")
@@ -75,6 +75,7 @@ impl Publisher {
                             .child(
                                 v_flex()
                                     .min_w_0()
+                                    .flex_1()
                                     .gap_1()
                                     .child(
                                         div()
@@ -93,9 +94,9 @@ impl Publisher {
                     .child(
                         h_flex()
                             .gap_2()
+                            .flex_shrink_0()
                             .child(
-                                Button::new(eid("inspect-material-set", &id))
-                                    .small()
+                                material_action(Button::new(eid("inspect-material-set", &id)))
                                     .label("查看素材")
                                     .accessibility_label(format!("查看素材集 {}", set.title))
                                     .on_click(cx.listener(move |s, _, _, cx| {
@@ -122,8 +123,7 @@ impl Publisher {
         let mut view = v_flex()
             .gap_3()
             .child(
-                Button::new("back-to-material-library")
-                    .small()
+                material_action(Button::new("back-to-material-library"))
                     .ghost()
                     .self_start()
                     .w_auto()
@@ -227,8 +227,13 @@ impl Publisher {
                                         material_file_size(asset.size)
                                     ))),
                             )
-                            .child(self.preview_button(asset, cx))
-                            .child(self.use_material_button(set, Some(asset), action, cx))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .flex_shrink_0()
+                                    .child(material_action(self.preview_button(asset, cx)))
+                                    .child(self.use_material_button(set, Some(asset), action, cx)),
+                            )
                     })),
             );
         }
@@ -244,11 +249,10 @@ impl Publisher {
     ) -> Button {
         let id = set.id.clone();
         let asset_id = asset.map(|asset| asset.id.clone());
-        Button::new(match &asset_id {
+        material_action(Button::new(match &asset_id {
             Some(asset_id) => eid("use-material-asset", asset_id),
             None => eid("use-material-set", &id),
-        })
-        .small()
+        }))
         .when(asset.is_none(), |button| button.primary())
         .label(label)
         .accessibility_label(format!(
@@ -260,6 +264,10 @@ impl Publisher {
             s.use_material_set(&id, asset_id.as_deref(), window, cx);
         }))
     }
+}
+
+fn material_action(button: Button) -> Button {
+    button.small().w(px(112.)).h(px(34.)).rounded(px(8.))
 }
 
 pub(super) fn material_summary(set: &MaterialSet) -> String {
