@@ -110,6 +110,7 @@ pub fn upload_progress_panel(job_id: &str, platform: Platform, progress: UploadP
         UploadProgress::Processing => (format!("{name}正在处理素材"), None),
         UploadProgress::EditorMissing => ("上传完成，正在等待作品编辑区".into(), None),
         UploadProgress::FillingForm => ("正在填写作品信息".into(), None),
+        UploadProgress::SettingCover => (format!("正在设置{name}视频封面"), None),
     };
     v_flex()
         .w_full()

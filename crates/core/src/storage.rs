@@ -292,11 +292,15 @@ impl Store {
                 continue;
             }
             Self::ensure_live_account(&tx, &a.id)?;
+            let mut content = content.clone();
+            if a.platform != Platform::Douyin {
+                content.douyin_video_covers = DouyinVideoCovers::default();
+            }
             let j = Job {
                 id: uuid::Uuid::new_v4().to_string(),
                 batch_id: batch_id.clone(),
                 account: a.clone(),
-                content: content.clone(),
+                content,
                 state: JobState::Queued,
                 message: "等待准备；最终提交需要单独操作".into(),
                 created_at: now(),

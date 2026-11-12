@@ -86,7 +86,6 @@ pub enum Command {
 pub struct Backend {
     pub tx: tokio::sync::mpsc::UnboundedSender<Command>,
     pub rx: mpsc::Receiver<Update>,
-    pub root: PathBuf,
     pub finished: Arc<(Mutex<bool>, Condvar)>,
 }
 struct Worker {
@@ -182,6 +181,12 @@ impl Worker {
             content.asset.kind == MediaKind::Video || capabilities.image_posts,
             "{}暂未开放图文发布",
             platform.name()
+        );
+        anyhow::ensure!(
+            platform != Platform::Douyin
+                || content.douyin_video_covers.is_empty()
+                || capabilities.custom_cover,
+            "抖音自定义封面暂未开放"
         );
         adapter.validate_content(content)
     }
@@ -444,7 +449,6 @@ impl Worker {
 }
 impl Backend {
     pub fn new(store: Store) -> Self {
-        let root = store.root.clone();
         let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
         let (updates, rx) = mpsc::channel();
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
@@ -508,12 +512,7 @@ impl Backend {
             *completion.0.lock().unwrap() = true;
             completion.1.notify_all();
         });
-        Self {
-            tx,
-            rx,
-            root,
-            finished,
-        }
+        Self { tx, rx, finished }
     }
     pub fn send(&self, c: Command) {
         let _ = self.tx.send(c);

@@ -10,8 +10,60 @@ fn setup() -> (tempfile::TempDir, Store, Account, Content) {
         title: "测试标题".into(),
         description: "说明".into(),
         tags: vec!["测试".into()],
+        douyin_video_covers: DouyinVideoCovers::default(),
     };
     (dir, store, a, content)
+}
+
+#[test]
+fn douyin_covers_are_optional_and_only_persist_on_douyin_video_jobs() {
+    let (dir, store, douyin, mut content) = setup();
+    let kuaishou = store.add_account("", Platform::Kuaishou).unwrap();
+    let old_json = serde_json::to_value(&content).unwrap();
+    assert!(old_json.get("douyin_video_covers").is_none());
+    assert_eq!(
+        serde_json::from_value::<Content>(old_json).unwrap(),
+        content
+    );
+
+    let portrait = dir.path().join("portrait.png");
+    let landscape = dir.path().join("landscape.jpg");
+    std::fs::write(&portrait, b"portrait cover").unwrap();
+    std::fs::write(&landscape, b"landscape cover").unwrap();
+    content.douyin_video_covers = DouyinVideoCovers {
+        portrait: Some(ImageFile::inspect(&portrait).unwrap()),
+        landscape: Some(ImageFile::inspect(&landscape).unwrap()),
+    };
+    store.save_draft("cover-draft", &content).unwrap();
+    assert_eq!(store.draft("cover-draft").unwrap(), Some(content.clone()));
+    let jobs = store
+        .enqueue("covers", &[douyin.clone(), kuaishou.clone()], &content)
+        .unwrap();
+    assert_eq!(store.job(&jobs[0].id).unwrap().content, content);
+    assert!(
+        store
+            .job(&jobs[1].id)
+            .unwrap()
+            .content
+            .douyin_video_covers
+            .is_empty()
+    );
+
+    let mut image_post = content.clone();
+    image_post.asset = store
+        .add_image_asset(std::slice::from_ref(&portrait))
+        .unwrap();
+    assert!(image_post.validate_for_platform(Platform::Douyin).is_err());
+    std::fs::write(&landscape, b"replaced cover with a different file").unwrap();
+    let error = store
+        .enqueue("changed-cover", &[douyin], &content)
+        .unwrap_err();
+    assert!(error.to_string().contains("抖音横版封面"));
+    assert!(
+        store
+            .enqueue("other-platform", &[kuaishou], &content)
+            .is_ok()
+    );
 }
 #[test]
 fn multiple_accounts_same_site_are_isolated_and_persisted() {

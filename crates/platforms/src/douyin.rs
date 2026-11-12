@@ -25,6 +25,9 @@ use std::{path::Path, sync::LazyLock, time::Duration};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+#[path = "douyin_video_cover.rs"]
+mod video_cover;
+
 pub const UPLOAD_URL: &str = "https://creator.douyin.com/creator-micro/content/upload";
 const IMAGE_UPLOAD_URL: &str =
     "https://creator.douyin.com/creator-micro/content/upload?default-tab=3";
@@ -805,7 +808,7 @@ impl PlatformAdapter for Douyin {
             name: "抖音",
             verified: false,
             separate_prepare: true,
-            custom_cover: false,
+            custom_cover: true,
             submit_enabled: true,
             image_posts: true,
         }
@@ -882,7 +885,7 @@ impl PlatformAdapter for Douyin {
         else {
             return Err(UserError("等待登录超时，请先在账号管理中完成登录".into()).into());
         };
-        let result: Result<Option<PhotoSnapshot>> = async {
+        let result: Result<(Option<PhotoSnapshot>, video_cover::VideoCoverSnapshot)> = async {
             let upload_ready = input_ready(&state);
             let nickname = session_nickname(&page, state).await;
             ctx.store
@@ -950,12 +953,16 @@ impl PlatformAdapter for Douyin {
                 )
                 .await
                 .map_err(|_| UserError("无法填写抖音图文的标题和描述。".into()))?;
-                return observation.photos.map(Some).ok_or_else(|| {
-                    UserError(
-                        "抖音已收到图片，但无法确认标题和描述。请检查文字长度后重新准备。".into(),
-                    )
-                    .into()
-                });
+                return observation
+                    .photos
+                    .map(|photos| (Some(photos), video_cover::VideoCoverSnapshot::default()))
+                    .ok_or_else(|| {
+                        UserError(
+                            "抖音已收到图片，但无法确认标题和描述。请检查文字长度后重新准备。"
+                                .into(),
+                        )
+                        .into()
+                    });
             }
             upload_file(&page, FILE_SELECTOR, &content.asset.path)
                 .await
@@ -977,11 +984,16 @@ impl PlatformAdapter for Douyin {
                         "抖音已显示上传完成，但无法确认标题和描述已填写。未执行最终提交。".into(),
                     )
                 })?;
-            Ok(None)
+            if !content.douyin_video_covers.is_empty() {
+                progress.set(Some(UploadProgress::SettingCover));
+            }
+            let covers =
+                video_cover::apply(&page, CREATOR_ORIGIN, &content.douyin_video_covers).await?;
+            Ok((None, covers))
         }
         .await;
-        let photos = match result {
-            Ok(photos) => photos,
+        let (photos, covers) = match result {
+            Ok(prepared_media) => prepared_media,
             Err(error) => {
                 browser.close().await?;
                 return Err(error);
@@ -992,6 +1004,7 @@ impl PlatformAdapter for Douyin {
             page,
             content: content.clone(),
             photos,
+            covers,
             sign_ins: self.sign_ins.clone(),
             account_id: ctx.job.account.id.clone(),
             publish_attempted: false,
@@ -1004,6 +1017,7 @@ struct DouyinPrepared {
     page: Page,
     content: Content,
     photos: Option<PhotoSnapshot>,
+    covers: video_cover::VideoCoverSnapshot,
     sign_ins: SignIns,
     account_id: String,
     publish_attempted: bool,
@@ -1016,6 +1030,7 @@ impl Prepared for DouyinPrepared {
             !self.publish_attempted,
             "该任务已尝试提交，请在抖音核对结果。"
         );
+        video_cover::verify(&self.page, CREATOR_ORIGIN, &self.covers).await?;
         preflight(&self.page, &self.content, self.photos.as_ref()).await?;
         self.receipt_observer = Some(DouyinReceiptObserver::start(&self.page).await?);
         Ok(())
@@ -1030,6 +1045,7 @@ impl Prepared for DouyinPrepared {
             !self.publish_attempted && self.receipt_observer.is_some(),
             "发布检查未完成，或该任务已尝试提交。"
         );
+        video_cover::verify(&self.page, CREATOR_ORIGIN, &self.covers).await?;
         self.publish_attempted = true;
         click_publish(&self.page, &self.content, self.photos.as_ref()).await
     }

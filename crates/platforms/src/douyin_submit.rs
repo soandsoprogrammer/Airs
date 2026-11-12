@@ -219,6 +219,7 @@ mod tests {
             title: "短片".into(),
             description: "正文".into(),
             tags: vec!["测试".into()],
+            douyin_video_covers: Default::default(),
         };
         let mut browser = BrowserSession::launch(profile.path()).await?;
         let page = browser
@@ -313,6 +314,7 @@ mod tests {
             title: "图文标题".into(),
             description: "首行\n次行".into(),
             tags: vec!["照片".into()],
+            douyin_video_covers: Default::default(),
         };
         let mut browser = BrowserSession::launch(profile.path()).await?;
         let page = browser

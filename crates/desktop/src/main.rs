@@ -21,7 +21,7 @@ use gpui_kit::{
 };
 use publisher_core::Platform;
 use publisher_core::*;
-use publisher_platforms::douyin::CREATOR_MANAGE_URL;
+use publisher_platforms::douyin::{CREATOR_MANAGE_URL, UPLOAD_URL as DOUYIN_UPLOAD_URL};
 use publisher_platforms::kuaishou::CREATOR_MANAGE_URL as KUAISHOU_MANAGE_URL;
 use publisher_platforms::sign_in::{SignInPreview, SignInStatus, VerificationAction};
 use publisher_platforms::upload_progress::UploadProgress;
@@ -85,7 +85,7 @@ impl Page {
             Self::Assets => "导入和预览本地视频与图片。",
             Self::Compose => "选择账号和素材，填写作品内容。",
             Self::Jobs => "跟踪准备进度，查看任务记录。",
-            Self::Settings => "管理后台浏览器和本地数据。",
+            Self::Settings => "管理后台浏览器，查看任务队列规则。",
         }
     }
 }
@@ -108,6 +108,7 @@ struct Publisher {
     selected_asset: Option<String>,
     compose_media_kind: MediaKind,
     compose_image_order: Vec<usize>,
+    douyin_video_covers: DouyinVideoCovers,
     photo_preview: Option<PhotoPreview>,
     video_preview: VideoPreview,
     preview_check: Option<PreviewCheck>,
@@ -247,6 +248,7 @@ impl Publisher {
             selected_asset: None,
             compose_media_kind: MediaKind::Video,
             compose_image_order: Vec::new(),
+            douyin_video_covers: DouyinVideoCovers::default(),
             photo_preview: None,
             video_preview: VideoPreview::default(),
             preview_check: None,
@@ -912,8 +914,14 @@ impl Publisher {
     }
 
     fn content(&self, cx: &App) -> Option<Content> {
+        let asset = self.compose_ordered_asset()?;
+        let douyin_video_covers = if asset.kind == MediaKind::Video {
+            self.douyin_video_covers.clone()
+        } else {
+            DouyinVideoCovers::default()
+        };
         Some(Content {
-            asset: self.compose_ordered_asset()?,
+            asset,
             title: self.title.read(cx).value().to_string(),
             description: self.description.read(cx).value().to_string(),
             tags: self
@@ -923,6 +931,7 @@ impl Publisher {
                 .split_whitespace()
                 .map(str::to_string)
                 .collect(),
+            douyin_video_covers,
         })
     }
 
@@ -974,6 +983,7 @@ impl Publisher {
                 )
                 .child(
                     h_flex()
+                        .when(count == 1, |controls| controls.hidden())
                         .justify_center()
                         .gap_3()
                         .child(
@@ -1841,6 +1851,43 @@ impl Publisher {
                                     "用「{identity}」{action}《{}》",
                                     j.content.title
                                 )))
+                                .when(
+                                    j.account.platform == Platform::Douyin
+                                        && !j.content.douyin_video_covers.is_empty(),
+                                    |panel| {
+                                        let covers = &j.content.douyin_video_covers;
+                                        panel.child(
+                                            h_flex().gap_3().flex_wrap().children(
+                                                [
+                                                    ("竖版封面", covers.portrait.as_ref()),
+                                                    ("横版封面", covers.landscape.as_ref()),
+                                                ]
+                                                .into_iter()
+                                                .filter_map(|(label, image)| {
+                                                    let image = image?;
+                                                    Some(
+                                                        v_flex()
+                                                            .gap_1()
+                                                            .child(
+                                                                img(image.path.clone())
+                                                                    .w(px(84.))
+                                                                    .h(px(58.))
+                                                                    .rounded_lg()
+                                                                    .bg(rgb(SURFACE))
+                                                                    .object_fit(ObjectFit::Contain),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(MUTED))
+                                                                    .child(label),
+                                                            ),
+                                                    )
+                                                }),
+                                            ),
+                                        )
+                                    },
+                                )
                                 .child(
                                     h_flex()
                                         .gap_2()
@@ -1890,6 +1937,20 @@ impl Publisher {
                                     })
                                     .on_click(cx.listener(move |s, _, _, _| {
                                         s.backend.send(Command::Resume(id.clone()))
+                                    })),
+                            );
+                        }
+                        if j.state == JobState::Failed
+                            && j.account.platform == Platform::Douyin
+                            && !j.content.douyin_video_covers.is_empty()
+                        {
+                            actions = actions.child(
+                                Button::new(eid("cover-open-creator", &j.id))
+                                    .ghost()
+                                    .icon(AppIcon::ArrowUpRight)
+                                    .label("打开抖音创作者中心")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.open_url(DOUYIN_UPLOAD_URL);
                                     })),
                             );
                         }
@@ -1959,26 +2020,6 @@ impl Publisher {
                 v_flex()
                     .gap_4()
                     .child(browser_panel)
-                    .child(
-                        panel().child(
-                            h_flex()
-                                .justify_between()
-                                .gap_4()
-                                .child(setting_title(
-                                    AppIcon::HardDrive,
-                                    "本地数据",
-                                    "账号登录资料、草稿和历史任务保存在当前用户目录。",
-                                ))
-                                .child(
-                                    Button::new("open-data")
-                                        .label("在访达中查看")
-                                        .icon(AppIcon::ArrowUpRight)
-                                        .on_click(cx.listener(|s, _, _, cx| {
-                                            cx.reveal_path(&s.backend.root)
-                                        })),
-                                ),
-                        ),
-                    )
                     .child(panel().child(setting_title(
                         AppIcon::ListChecks,
                         "任务队列",
@@ -2117,26 +2158,6 @@ impl Render for Publisher {
                     })),
             );
         }
-        sidebar = sidebar.child(div().flex_1()).child(
-            div().border_t_1().border_color(rgb(BORDER)).pt_3().child(
-                Button::new("sidebar-data")
-                    .ghost()
-                    .w_full()
-                    .accessibility_label("查看本地数据目录")
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_3()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(glyph(AppIcon::HardDrive, 16., MUTED))
-                            .child(div().flex_1().child("本地数据"))
-                            .child(glyph(AppIcon::ArrowUpRight, 14., MUTED)),
-                    )
-                    .on_click(cx.listener(|s, _, _, cx| cx.reveal_path(&s.backend.root))),
-            ),
-        );
-
         let account_details = self
             .account_details
             .as_ref()

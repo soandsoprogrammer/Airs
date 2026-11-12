@@ -3,6 +3,28 @@ use crate::accounts::platform_icon;
 use gpui_kit::component::input::Textarea;
 use publisher_core::Asset;
 
+#[derive(Clone, Copy)]
+enum CoverOrientation {
+    Portrait,
+    Landscape,
+}
+
+impl CoverOrientation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Portrait => "竖版封面",
+            Self::Landscape => "横版封面",
+        }
+    }
+
+    fn image(self, covers: &DouyinVideoCovers) -> Option<&ImageFile> {
+        match self {
+            Self::Portrait => covers.portrait.as_ref(),
+            Self::Landscape => covers.landscape.as_ref(),
+        }
+    }
+}
+
 impl Publisher {
     pub(super) fn compose(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let wide = workspace_content_width(window) >= 760.;
@@ -18,6 +40,9 @@ impl Publisher {
                     .min_w_0()
                     .gap_4()
                     .child(self.compose_media(cx))
+                    .when(self.has_selected_douyin_account(), |layout| {
+                        layout.child(self.compose_douyin_settings(cx))
+                    })
                     .child(self.compose_fields(cx)),
             )
             .child(
@@ -25,6 +50,154 @@ impl Publisher {
                     .when(wide, |panel| panel.w(px(326.)).flex_shrink_0()),
             )
             .into_any_element()
+    }
+
+    fn has_selected_douyin_account(&self) -> bool {
+        self.snapshot.accounts.iter().any(|account| {
+            account.platform == Platform::Douyin && self.selected_accounts.contains(&account.id)
+        })
+    }
+
+    fn compose_douyin_settings(&self, cx: &mut Context<Self>) -> Div {
+        let panel = surface().gap_3().child(section_title("抖音设置"));
+        if self.compose_media_kind == MediaKind::Images {
+            return panel.child(muted_text("图文以第一张图片作为封面。"));
+        }
+        panel
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_stretch()
+                    .child(self.compose_cover_slot(CoverOrientation::Portrait, cx))
+                    .child(self.compose_cover_slot(CoverOrientation::Landscape, cx)),
+            )
+            .child(muted_text("未选择的封面沿用抖音默认设置。"))
+    }
+
+    fn compose_cover_slot(&self, orientation: CoverOrientation, cx: &mut Context<Self>) -> Div {
+        let label = orientation.label();
+        let image = orientation.image(&self.douyin_video_covers);
+        let preview = if let Some(image) = image {
+            let path = image.path.clone();
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            Button::new(eid("preview-douyin-cover", label))
+                .ghost()
+                .w_full()
+                .h(px(88.))
+                .p_0()
+                .rounded_lg()
+                .bg(rgb(SURFACE))
+                .accessibility_label(format!("预览{label}，{filename}"))
+                .tooltip(filename)
+                .child(img(path.clone()).size_full().object_fit(ObjectFit::Contain))
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    s.photo_preview = Some(PhotoPreview {
+                        page: Page::Compose,
+                        paths: vec![path.clone()],
+                        index: 0,
+                    });
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
+            v_flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .w_full()
+                .h(px(88.))
+                .rounded_lg()
+                .bg(rgb(SURFACE))
+                .child(glyph(AppIcon::Image, 18., MUTED))
+                .child(muted_text("抖音默认"))
+                .into_any_element()
+        };
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(CANVAS))
+            .child(field_title(label))
+            .child(preview)
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        Button::new(eid("select-douyin-cover", label))
+                            .small()
+                            .label(if image.is_some() {
+                                "更换图片"
+                            } else {
+                                "选择图片"
+                            })
+                            .accessibility_label(format!("选择{label}图片"))
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                s.pick_douyin_cover(orientation, cx);
+                            })),
+                    )
+                    .when(image.is_some(), |row| {
+                        row.child(
+                            Button::new(eid("clear-douyin-cover", label))
+                                .small()
+                                .ghost()
+                                .label("恢复默认")
+                                .accessibility_label(format!("恢复{label}默认设置"))
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    s.set_douyin_cover(orientation, None);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+    }
+
+    fn pick_douyin_cover(&mut self, orientation: CoverOrientation, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(format!("选择{}", orientation.label()).into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let image = cx
+                .background_executor()
+                .spawn(async move { ImageFile::inspect(&path) })
+                .await;
+            let _ = this.update(cx, |s, cx| {
+                if s.page == Page::Compose && s.compose_media_kind == MediaKind::Video {
+                    match image {
+                        Ok(image) => s.set_douyin_cover(orientation, Some(image)),
+                        Err(error) => s.message = format!("{}：{error}", orientation.label()),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_douyin_cover(&mut self, orientation: CoverOrientation, image: Option<ImageFile>) {
+        let slot = match orientation {
+            CoverOrientation::Portrait => &mut self.douyin_video_covers.portrait,
+            CoverOrientation::Landscape => &mut self.douyin_video_covers.landscape,
+        };
+        if *slot != image {
+            *slot = image;
+            self.reset_compose_batch();
+        }
     }
 
     fn compose_media(&self, cx: &mut Context<Self>) -> Div {
@@ -592,6 +765,7 @@ impl Publisher {
         if let Some(draft) = self.snapshot.draft.clone() {
             let content_changed = self.content(cx).as_ref() != Some(&draft);
             self.select_compose_asset(draft.asset.id.clone());
+            self.douyin_video_covers = draft.douyin_video_covers;
             if draft.asset.kind == MediaKind::Images
                 && let Some(asset) = self.compose_selected_asset()
             {

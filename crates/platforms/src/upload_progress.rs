@@ -10,6 +10,7 @@ pub enum UploadProgress {
     Processing,
     EditorMissing,
     FillingForm,
+    SettingCover,
 }
 
 /// Shares the latest observed upload state with the desktop without persisting it.

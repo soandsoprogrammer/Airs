@@ -89,6 +89,28 @@ pub struct ImageFile {
     pub modified_ms: u128,
 }
 
+impl ImageFile {
+    pub fn inspect(path: &Path) -> Result<Self> {
+        let (path, size, modified_ms) = inspect_file(path, MediaKind::Images)?;
+        Ok(Self {
+            path,
+            size,
+            modified_ms,
+        })
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy();
+        let actual =
+            Self::inspect(&self.path).map_err(|error| anyhow::anyhow!("图片 {name}：{error}"))?;
+        ensure!(
+            actual.size == self.size && actual.modified_ms == self.modified_ms,
+            "图片 {name} 在导入后已改变，请重新选择"
+        );
+        Ok(())
+    }
+}
+
 impl Asset {
     pub fn inspect(path: &Path) -> Result<Self> {
         let (path, size, modified_ms) = inspect_file(path, MediaKind::Video)?;
@@ -109,19 +131,15 @@ impl Asset {
         let mut images = Vec::with_capacity(paths.len());
         let mut size = 0_u64;
         for path in paths {
-            let (path, bytes, modified_ms) = inspect_file(path, MediaKind::Images)?;
+            let image = ImageFile::inspect(path)?;
             ensure!(
-                seen.insert(path.clone()),
+                seen.insert(image.path.clone()),
                 "同一组图文不能重复添加同一张图片"
             );
             size = size
-                .checked_add(bytes)
+                .checked_add(image.size)
                 .ok_or_else(|| anyhow::anyhow!("图片组过大"))?;
-            images.push(ImageFile {
-                path,
-                size: bytes,
-                modified_ms,
-            });
+            images.push(image);
         }
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -145,18 +163,7 @@ impl Asset {
             MediaKind::Images => {
                 ensure!(!self.images.is_empty(), "请选择至少一张图片");
                 for image in &self.images {
-                    let (_, size, modified_ms) =
-                        inspect_file(&image.path, self.kind).map_err(|error| {
-                            anyhow::anyhow!(
-                                "图片 {}：{error}",
-                                image.path.file_name().unwrap_or_default().to_string_lossy()
-                            )
-                        })?;
-                    ensure!(
-                        size == image.size && modified_ms == image.modified_ms,
-                        "图片 {} 在导入后已改变，请重新导入",
-                        image.path.file_name().unwrap_or_default().to_string_lossy()
-                    );
+                    image.verify()?;
                 }
             }
         }
@@ -194,12 +201,43 @@ fn inspect_file(path: &Path, kind: MediaKind) -> Result<(PathBuf, u64, u128)> {
         .as_millis();
     Ok((path, metadata.len(), modified_ms))
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DouyinVideoCovers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portrait: Option<ImageFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landscape: Option<ImageFile>,
+}
+
+impl DouyinVideoCovers {
+    pub fn is_empty(&self) -> bool {
+        self.portrait.is_none() && self.landscape.is_none()
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        for (label, image) in [
+            ("抖音竖版封面", self.portrait.as_ref()),
+            ("抖音横版封面", self.landscape.as_ref()),
+        ] {
+            if let Some(image) = image {
+                image
+                    .verify()
+                    .map_err(|error| anyhow::anyhow!("{label}：{error}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Content {
     pub asset: Asset,
     pub title: String,
     pub description: String,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "DouyinVideoCovers::is_empty")]
+    pub douyin_video_covers: DouyinVideoCovers,
 }
 impl Content {
     pub fn title_limit(platform: Platform, kind: MediaKind) -> usize {
@@ -230,6 +268,7 @@ impl Content {
     }
 
     pub fn validate_for_platform(&self, platform: Platform) -> Result<()> {
+        self.verify_platform_files(platform)?;
         let limit = Self::title_limit(platform, self.asset.kind);
         ensure!(
             Self::title_length(self.title.trim(), platform, self.asset.kind) <= limit,
@@ -288,6 +327,17 @@ impl Content {
                     image.path.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
+        }
+        Ok(())
+    }
+
+    pub fn verify_platform_files(&self, platform: Platform) -> Result<()> {
+        if platform == Platform::Douyin && !self.douyin_video_covers.is_empty() {
+            ensure!(
+                self.asset.kind == MediaKind::Video,
+                "抖音图文使用首图作封面"
+            );
+            self.douyin_video_covers.verify()?;
         }
         Ok(())
     }

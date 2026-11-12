@@ -97,6 +97,7 @@ impl Engine {
         let job = self.store.job(&id)?;
         if matches!(job.state, JobState::Failed | JobState::Cancelled) {
             job.content.validate()?;
+            job.content.validate_for_platform(job.account.platform)?;
             self.store
                 .transition(&id, JobState::Queued, "用户重新准备；保留之前的执行记录")?;
         }
@@ -200,6 +201,12 @@ impl Engine {
         if job.content.asset.kind == MediaKind::Images && !capabilities.image_posts {
             return Err(UserError("该平台尚不支持图文发布".into()).into());
         }
+        if job.account.platform == Platform::Douyin
+            && !job.content.douyin_video_covers.is_empty()
+            && !capabilities.custom_cover
+        {
+            return Err(UserError("该平台尚不支持自定义封面".into()).into());
+        }
         job.content
             .validate()
             .and_then(|()| job.content.validate_for_platform(job.account.platform))
@@ -236,7 +243,12 @@ impl Engine {
             let _ = prepared.close().await;
             anyhow::bail!("已取消");
         }
-        if let Err(e) = job.content.asset.verify() {
+        if let Err(e) = job
+            .content
+            .asset
+            .verify()
+            .and_then(|()| job.content.verify_platform_files(job.account.platform))
+        {
             let _ = prepared.close().await;
             return Err(UserError(e.to_string()).into());
         }

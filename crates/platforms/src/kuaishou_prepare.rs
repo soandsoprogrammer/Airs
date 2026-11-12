@@ -456,6 +456,7 @@ mod tests {
                 title: "示例标题".into(),
                 description: "示例说明".into(),
                 tags: vec!["示例话题".into()],
+                douyin_video_covers: Default::default(),
             };
             let caption = caption(&content)?;
             assert_eq!(caption, "示例标题\n示例说明\n#示例话题");
