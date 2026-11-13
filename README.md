@@ -86,4 +86,4 @@ cargo run --locked -p publisher-platforms --example probe_douyin
 
 | 微信收款码 | 支付宝收款码 |
 | :---: | :---: |
-| 待添加图片 | 待添加图片 |
+| <img src="docs/sponsor/wechat-pay.png" alt="微信收款码" width="280"> | <img src="docs/sponsor/alipay.png" alt="支付宝收款码" width="280"> |
