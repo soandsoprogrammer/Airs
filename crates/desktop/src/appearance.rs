@@ -141,6 +141,7 @@ pub fn upload_progress_panel(job_id: &str, platform: Platform, progress: UploadP
             percent: Some(percent),
         } => (format!("{name}上传进度"), Some(percent)),
         UploadProgress::Uploading { percent: None } => (format!("等待{name}返回上传进度"), None),
+        UploadProgress::Retrying => (format!("{name}提示上传失败，正在重传一次"), None),
         UploadProgress::Processing => (format!("{name}正在处理素材"), None),
         UploadProgress::EditorMissing => ("上传完成，正在等待作品编辑区".into(), None),
         UploadProgress::FillingForm => ("正在填写作品信息".into(), None),

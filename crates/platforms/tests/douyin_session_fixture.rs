@@ -106,6 +106,13 @@ async fn creator_page_distinguishes_session_from_interaction_required() -> anyho
     assert_eq!(state["authenticated"], json!(false));
     assert_eq!(state["needsInteraction"], json!(true));
 
+    home.evaluate(
+        r#"document.body.insertAdjacentHTML('beforeend', '<p>二维码已失效</p><div class="second-verify-panel"><article class="uc-ui-verify_sms-verify"><input placeholder="请输入验证码"></article></div>')"#,
+    )
+    .await?;
+    let state = creator_state(&home, &origin).await?;
+    assert_eq!(state["qrStatus"], json!("verifyInApp"));
+
     let upload = browser
         .browser
         .new_page(format!("{origin}/creator-micro/content/upload"))

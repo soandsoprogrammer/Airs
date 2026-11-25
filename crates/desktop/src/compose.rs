@@ -27,34 +27,64 @@ impl CoverOrientation {
 
 impl Publisher {
     pub(super) fn compose(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let wide = workspace_content_width(window) >= 760.;
+        let content_width = (window.viewport_size().width.as_f32() - SIDEBAR_WIDTH)
+            .min(COMPOSE_MAX_WIDTH)
+            - WORKSPACE_PADDING * 2.;
+        let three_columns = content_width >= 1152.;
+        let side_accounts = content_width >= 760.;
+        let description_height = if three_columns {
+            (window.viewport_size().height.as_f32() - 550.).clamp(180., 320.)
+        } else {
+            112.
+        };
+        let media = self.compose_media(three_columns, cx);
+        let accounts = self.compose_accounts(cx);
+        let fields = self.compose_fields(description_height, cx);
+        let covers = self
+            .has_selected_douyin_account()
+            .then(|| self.compose_douyin_settings(three_columns, cx));
+
+        let columns = if three_columns {
+            h_flex()
+                .items_start()
+                .gap_5()
+                .child(media.w(px(294.)).flex_shrink_0())
+                .child(fields.flex_1())
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .w(px(324.))
+                        .flex_shrink_0()
+                        .child(accounts)
+                        .children(covers),
+                )
+        } else if side_accounts {
+            h_flex()
+                .items_start()
+                .gap_4()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_4()
+                        .child(media)
+                        .child(fields)
+                        .children(covers),
+                )
+                .child(accounts.w(px(304.)).flex_shrink_0())
+        } else {
+            v_flex()
+                .gap_4()
+                .child(media)
+                .child(accounts)
+                .child(fields)
+                .children(covers)
+        };
         v_flex()
             .w_full()
-            .gap_4()
+            .gap(if three_columns { px(20.) } else { px(16.) })
             .child(self.compose_toolbar(cx))
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .gap_4()
-                    .when(wide, |layout| layout.flex_row().items_start())
-                    .when(!wide, |layout| layout.flex_col())
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_4()
-                            .child(self.compose_media(cx))
-                            .when(!wide, |layout| layout.child(self.compose_accounts(cx)))
-                            .child(self.compose_fields(cx))
-                            .when(self.has_selected_douyin_account(), |layout| {
-                                layout.child(self.compose_douyin_settings(cx))
-                            }),
-                    )
-                    .when(wide, |layout| {
-                        layout.child(self.compose_accounts(cx).w(px(304.)).flex_shrink_0())
-                    }),
-            )
+            .child(columns.w_full())
             .into_any_element()
     }
 
@@ -114,9 +144,13 @@ impl Publisher {
                         Button::new("save-draft")
                             .small()
                             .label("保存草稿")
-                            .disabled(self.compose_selected_asset().is_none())
+                            .disabled(
+                                self.compose_selected_asset().is_none()
+                                    || self.compose_tags(cx).len() > 5,
+                            )
                             .on_click(cx.listener(|s, _, _, cx| {
-                                if let Some(content) = s.content(cx) {
+                                if let Some(mut content) = s.content(cx) {
+                                    content.title = s.title.read(cx).value().to_string();
                                     s.backend.send(Command::SaveDraft(content));
                                 }
                             })),
@@ -130,7 +164,7 @@ impl Publisher {
         })
     }
 
-    fn compose_douyin_settings(&self, cx: &mut Context<Self>) -> Div {
+    fn compose_douyin_settings(&self, compact: bool, cx: &mut Context<Self>) -> Div {
         let panel = surface().gap_3().child(section_title("抖音封面"));
         if self.compose_media_kind == MediaKind::Images {
             return panel.child(muted_text("图文以第一张图片作为封面。"));
@@ -139,13 +173,19 @@ impl Publisher {
             h_flex()
                 .gap_3()
                 .items_stretch()
-                .child(self.compose_cover_slot(CoverOrientation::Portrait, cx))
-                .child(self.compose_cover_slot(CoverOrientation::Landscape, cx)),
+                .child(self.compose_cover_slot(CoverOrientation::Portrait, compact, cx))
+                .child(self.compose_cover_slot(CoverOrientation::Landscape, compact, cx)),
         )
     }
 
-    fn compose_cover_slot(&self, orientation: CoverOrientation, cx: &mut Context<Self>) -> Div {
+    fn compose_cover_slot(
+        &self,
+        orientation: CoverOrientation,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let label = orientation.label();
+        let preview_height = if compact { 64. } else { 88. };
         let image = orientation.image(&self.douyin_video_covers);
         let preview = if let Some(image) = image {
             let path = image.path.clone();
@@ -157,7 +197,7 @@ impl Publisher {
             Button::new(eid("preview-douyin-cover", label))
                 .ghost()
                 .w_full()
-                .h(px(88.))
+                .h(px(preview_height))
                 .p_0()
                 .rounded_lg()
                 .bg(rgb(SURFACE))
@@ -179,7 +219,7 @@ impl Publisher {
                 .justify_center()
                 .gap_1()
                 .w_full()
-                .h(px(88.))
+                .h(px(preview_height))
                 .rounded_lg()
                 .bg(rgb(SURFACE))
                 .child(glyph(AppIcon::Image, 18., MUTED))
@@ -270,7 +310,7 @@ impl Publisher {
         }
     }
 
-    fn compose_media(&self, cx: &mut Context<Self>) -> Div {
+    fn compose_media(&self, spacious: bool, cx: &mut Context<Self>) -> Div {
         let kind = self.compose_media_kind;
         let picked = self.compose_ordered_asset();
         let selected_set = self
@@ -296,38 +336,25 @@ impl Publisher {
         } else {
             "选择素材"
         };
-        let mut panel = surface().gap_3().child(
-            h_flex()
-                .flex_wrap()
-                .justify_between()
-                .gap_2()
-                .child(section_title(heading))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("compose-import-media")
-                                .small()
-                                .when(has_sets, |button| button.ghost())
-                                .icon(AppIcon::Plus)
-                                .label("导入素材")
-                                .on_click(cx.listener(|s, _, _, cx| s.pick_materials(cx))),
-                        )
-                        .when(has_sets, |actions| {
-                            actions.child(
-                                Button::new("compose-toggle-library")
-                                    .small()
-                                    .icon(AppIcon::FolderOpen)
-                                    .label(browse_label)
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        s.compose_asset_picker_open = !s.compose_asset_picker_open;
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
-                ),
-        );
-        panel = panel.child(if let Some(asset) = picked.as_ref() {
+        let import = Button::new("compose-import-media")
+            .small()
+            .when(has_sets, |button| button.ghost())
+            .icon(AppIcon::Plus)
+            .label("导入素材")
+            .on_click(cx.listener(|s, _, _, cx| s.pick_materials(cx)));
+        let browse = Button::new("compose-toggle-library")
+            .small()
+            .icon(AppIcon::FolderOpen)
+            .label(browse_label)
+            .on_click(cx.listener(|s, _, _, cx| {
+                s.compose_asset_picker_open = !s.compose_asset_picker_open;
+                cx.notify();
+            }));
+        let actions = h_flex()
+            .gap_2()
+            .when(has_sets, |actions| actions.child(browse))
+            .child(import);
+        let details = if let Some(asset) = picked.as_ref() {
             v_flex()
                 .gap_2()
                 .p_3()
@@ -347,31 +374,63 @@ impl Publisher {
                         )
                     },
                 )
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .gap_3()
-                        .child(asset_label(asset).flex_1())
-                        .child(self.preview_button(asset, cx)),
-                )
+                .child(self.compose_media_preview(asset, spacious, cx))
+                .child(asset_label(asset))
         } else {
-            h_flex()
+            div()
+                .flex()
                 .gap_3()
                 .p_3()
                 .rounded(px(10.))
                 .bg(rgb(CANVAS))
-                .child(icon_tile(media_icon(kind), 36., ACCENT, ACCENT_WASH))
+                .when(spacious, |stage| {
+                    stage
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .min_h(px(198.))
+                        .text_center()
+                        .px_4()
+                })
+                .when(!spacious, |stage| stage.items_center())
+                .child(icon_tile(
+                    media_icon(kind),
+                    if spacious { 48. } else { 36. },
+                    ACCENT,
+                    ACCENT_WASH,
+                ))
                 .child(
                     v_flex()
                         .min_w_0()
                         .gap_1()
+                        .when(spacious, |details| details.w_full().items_center())
                         .child(field_title(empty_label))
                         .when_some(selected_title, |details, title| {
-                            details.child(div().truncate().text_sm().child(title))
+                            details.child(div().w_full().truncate().text_sm().child(title))
                         })
                         .child(muted_text(empty_hint)),
                 )
-        });
+        };
+        let mut panel = if spacious {
+            surface()
+                .gap_3()
+                .child(section_title(heading))
+                .child(details)
+                .child(actions)
+        } else {
+            // Keep both actions beside the heading when the media card spans the main column.
+            surface()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .justify_between()
+                        .gap_2()
+                        .child(section_title(heading))
+                        .child(actions),
+                )
+                .child(details)
+        };
         if self.compose_asset_picker_open && has_sets {
             panel = panel.child(
                 v_flex()
@@ -396,6 +455,95 @@ impl Publisher {
             );
         }
         panel
+    }
+
+    pub(super) fn update_compose_thumbnail(&mut self, cx: &mut Context<Self>) {
+        let Some(asset) = self
+            .compose_selected_asset()
+            .filter(|asset| asset.kind == MediaKind::Video)
+        else {
+            self.compose_thumbnail = None;
+            return;
+        };
+        let path = asset.path.clone();
+        let modified_ms = asset.modified_ms;
+        if self
+            .compose_thumbnail
+            .as_ref()
+            .is_some_and(|preview| preview.path == path && preview.modified_ms == modified_ms)
+        {
+            return;
+        }
+        let video = path.clone();
+        let request = cx
+            .background_executor()
+            .spawn(async move { VideoPreview::thumbnail(&video).ok() });
+        let key = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let image = request
+                .await
+                .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)));
+            let _ = this.update(cx, |s, cx| {
+                if let Some(preview) = &mut s.compose_thumbnail
+                    && preview.path == key
+                    && preview.modified_ms == modified_ms
+                {
+                    preview.image = image;
+                    cx.notify();
+                }
+            });
+        });
+        self.compose_thumbnail = Some(ComposeThumbnail {
+            path,
+            modified_ms,
+            image: None,
+            _task: task,
+        });
+    }
+
+    fn compose_media_preview(&self, asset: &Asset, spacious: bool, cx: &mut Context<Self>) -> Div {
+        let height = if spacious { 220. } else { 142. };
+        let image = if asset.kind == MediaKind::Images {
+            asset.images.first().map(|image| img(image.path.clone()))
+        } else {
+            self.compose_thumbnail
+                .as_ref()
+                .filter(|preview| {
+                    preview.path == asset.path && preview.modified_ms == asset.modified_ms
+                })
+                .and_then(|preview| preview.image.clone())
+                .map(img)
+        };
+        div()
+            .w_full()
+            .h(px(height))
+            .relative()
+            .overflow_hidden()
+            .rounded(px(8.))
+            .bg(rgb(NAV_SURFACE))
+            .child(match image {
+                Some(image) => image
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(height))
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                None => v_flex()
+                    .size_full()
+                    .justify_center()
+                    .items_center()
+                    .child(glyph(media_icon(asset.kind), 28., NAV_ACCENT))
+                    .into_any_element(),
+            })
+            .child(
+                div()
+                    .absolute()
+                    .bottom_2()
+                    .right_2()
+                    .child(self.preview_button(asset, cx).small()),
+            )
     }
 
     fn compose_material_option(&self, set: &MaterialSet, cx: &mut Context<Self>) -> Div {
@@ -508,9 +656,8 @@ impl Publisher {
             }))
     }
 
-    fn compose_fields(&self, cx: &mut Context<Self>) -> Div {
-        let title = self.title.read(cx).value();
-        let title = title.trim();
+    fn compose_fields(&self, description_height: f32, cx: &mut Context<Self>) -> Div {
+        let title = self.compose_title(cx);
         let selected_platforms: HashSet<_> = self
             .snapshot
             .accounts
@@ -539,7 +686,7 @@ impl Publisher {
             } else {
                 String::new()
             };
-            let length = Content::title_length(title, platform, kind);
+            let length = Content::title_length(&title, platform, kind);
             let limit = Content::title_limit(platform, kind);
             div()
                 .text_xs()
@@ -560,28 +707,186 @@ impl Publisher {
                                 .children(counters.iter().copied().map(counter)),
                         ),
                     )
-                    .child(Input::new(&self.title).aria_label("作品标题")),
+                    .child(Textarea::new(&self.title).h(px(64.)).aria_label("作品标题")),
             )
             .child(
                 v_flex().gap_2().child(field_title("描述")).child(
                     Textarea::new(&self.description)
-                        .h(px(112.))
+                        .h(px(description_height))
                         .aria_label("作品描述"),
                 ),
             )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(field_title("标签"))
-                    .child(Input::new(&self.tags).aria_label("作品标签"))
-                    .child(muted_text(
-                        if selected_platforms.contains(&Platform::Kuaishou) {
-                            "快手标题、描述与标签合计最多 500 字。标签无需加 #。"
-                        } else {
-                            "描述与标签合计最多 1000 字。标签无需加 #。"
-                        },
-                    )),
+            .child(self.compose_tag_editor(selected_platforms.contains(&Platform::Kuaishou), cx))
+    }
+
+    pub(super) fn compose_title(&self, cx: &App) -> String {
+        self.title
+            .read(cx)
+            .value()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn compose_tags(&self, cx: &App) -> Vec<String> {
+        let pending = self.tag_input.read(cx).value();
+        let mut seen = HashSet::new();
+        self.selected_tags
+            .iter()
+            .map(String::as_str)
+            .chain(
+                pending.split(|c: char| {
+                    c.is_whitespace() || matches!(c, '#' | '＃' | ',' | '，' | '、')
+                }),
             )
+            .filter(|tag| !tag.is_empty() && seen.insert(tag.to_ascii_lowercase()))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub(super) fn add_typed_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tags = self.compose_tags(cx);
+        if tags.len() > 5 {
+            return;
+        }
+        if self.selected_tags != tags {
+            self.selected_tags = tags;
+            self.reset_compose_batch();
+        }
+        self.tag_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn compose_tag_editor(&self, kuaishou: bool, cx: &mut Context<Self>) -> Div {
+        let tags = self.compose_tags(cx);
+        let count = tags.len();
+        let pending = !self.tag_input.read(cx).value().trim().is_empty();
+        let recent: Vec<_> = self
+            .snapshot
+            .recent_tags
+            .iter()
+            .filter(|recent| !tags.iter().any(|tag| tag.eq_ignore_ascii_case(recent)))
+            .take(10)
+            .collect();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex().justify_between().child(field_title("标签")).child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if count > 5 { 0xa83646 } else { MUTED }))
+                        .child(format!("{count} / 5")),
+                ),
+            )
+            .when(!self.selected_tags.is_empty(), |section| {
+                section.child(h_flex().flex_wrap().gap_2().children(
+                    self.selected_tags.iter().enumerate().map(|(index, tag)| {
+                        let tag = tag.clone();
+                        Button::new(eid("remove-compose-tag", &tag))
+                            .small()
+                            .ghost()
+                            .rounded_full()
+                            .bg(rgb(ACCENT_WASH))
+                            .text_color(rgb(ACCENT))
+                            .max_w(px(220.))
+                            .accessibility_label(format!("移除标签 {tag}"))
+                            .tooltip(format!("移除 #{tag}"))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .min_w_0()
+                                    .child(div().truncate().child(format!("#{tag}")))
+                                    .child(glyph(AppIcon::X, 12., ACCENT)),
+                            )
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                if s.selected_tags.get(index) == Some(&tag) {
+                                    s.selected_tags.remove(index);
+                                    s.reset_compose_batch();
+                                    cx.notify();
+                                }
+                            }))
+                    }),
+                ))
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&self.tag_input).aria_label("作品标签")),
+                    )
+                    .child(
+                        Button::new("add-compose-tags")
+                            .small()
+                            .h(px(32.))
+                            .icon(AppIcon::Plus)
+                            .label("添加")
+                            .disabled(!pending || count > 5)
+                            .on_click(cx.listener(|s, _, window, cx| s.add_typed_tags(window, cx))),
+                    ),
+            )
+            .when(!recent.is_empty(), |section| {
+                section.child(
+                    v_flex()
+                        .gap_2()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .child(muted_text("最近使用"))
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .children(recent.into_iter().map(|tag| {
+                                    let tag = tag.clone();
+                                    Button::new(eid("recent-compose-tag", &tag))
+                                        .small()
+                                        .ghost()
+                                        .rounded_full()
+                                        .bg(rgb(CANVAS))
+                                        .max_w(px(220.))
+                                        .disabled(count >= 5)
+                                        .tooltip(format!("#{tag}"))
+                                        .accessibility_label(format!("添加历史标签 {tag}"))
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .min_w_0()
+                                                .child(glyph(AppIcon::Plus, 12., MUTED))
+                                                .child(div().truncate().child(format!("#{tag}"))),
+                                        )
+                                        .on_click(cx.listener(move |s, _, window, cx| {
+                                            let tags = s.compose_tags(cx);
+                                            if tags.len() < 5
+                                                && !tags
+                                                    .iter()
+                                                    .any(|item| item.eq_ignore_ascii_case(&tag))
+                                            {
+                                                s.selected_tags = tags;
+                                                s.selected_tags.push(tag.clone());
+                                                s.tag_input.update(cx, |input, cx| {
+                                                    input.set_value("", window, cx)
+                                                });
+                                                s.reset_compose_batch();
+                                                cx.notify();
+                                            }
+                                        }))
+                                })),
+                        ),
+                )
+            })
+            .child(muted_text(if count > 5 {
+                "最多 5 个标签，请删减后再保存或准备发布。"
+            } else if kuaishou {
+                "快手标题、描述与标签合计最多 500 字。"
+            } else {
+                "描述与标签合计最多 1000 字。"
+            }))
     }
 
     fn compose_accounts(&self, cx: &mut Context<Self>) -> Div {
@@ -618,6 +923,8 @@ impl Publisher {
                     .small()
                     .ghost()
                     .h(px(29.))
+                    .w(px(if label.chars().count() > 2 { 55. } else { 44. }))
+                    .px_1()
                     .toggled(selected)
                     .label(label)
                     .when(selected, |button| {
@@ -730,7 +1037,7 @@ impl Publisher {
     pub(super) fn compose_footer(&self, cx: &mut Context<Self>) -> Div {
         let picked = self.compose_selected_asset();
         let account_count = self.selected_accounts.len();
-        let title_empty = self.title.read(cx).value().trim().is_empty();
+        let title_empty = self.compose_title(cx).is_empty();
         let missing = if picked.is_none() {
             Some(match self.compose_media_kind {
                 MediaKind::Video => "请选择视频",
@@ -747,6 +1054,8 @@ impl Publisher {
             Some("所选账号中有平台暂不支持此类作品")
         } else if title_empty {
             Some("请填写作品标题")
+        } else if self.compose_tags(cx).len() > 5 {
+            Some("请将标签减少到 5 个以内")
         } else {
             None
         };
@@ -767,7 +1076,7 @@ impl Publisher {
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
             .child(
-                workspace_frame()
+                compose_frame()
                     .flex_row()
                     .items_center()
                     .py_3()
@@ -1024,9 +1333,9 @@ impl Publisher {
             self.description.update(cx, |input, cx| {
                 input.set_value(draft.description, window, cx)
             });
-            self.tags.update(cx, |input, cx| {
-                input.set_value(draft.tags.join(" "), window, cx)
-            });
+            self.selected_tags = draft.tags;
+            self.tag_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
             if content_changed {
                 self.reset_compose_batch();
             }

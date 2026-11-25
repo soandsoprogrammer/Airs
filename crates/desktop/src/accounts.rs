@@ -354,6 +354,8 @@ impl Publisher {
         } else {
             let label = if account.session == SessionStatus::Ready {
                 "检查会话"
+            } else if account.platform == Platform::Douyin {
+                "登录抖音"
             } else if account.platform == Platform::Xiaohongshu {
                 "登录小红书"
             } else if account.platform == Platform::WechatChannels {

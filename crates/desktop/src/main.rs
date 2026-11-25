@@ -30,8 +30,8 @@ use publisher_core::*;
 use publisher_platforms::douyin::{CREATOR_MANAGE_URL, UPLOAD_URL as DOUYIN_UPLOAD_URL};
 use publisher_platforms::kuaishou::CREATOR_MANAGE_URL as KUAISHOU_MANAGE_URL;
 use publisher_platforms::sign_in::{
-    PublishSmsPreview, SignInPreview, SignInStatus, VerificationAction, WechatChannelChoice,
-    WechatChannelsPreview,
+    DouyinLoginSms, PublishSmsPreview, SignInPreview, SignInStatus, VerificationAction,
+    WechatChannelChoice, WechatChannelsPreview,
 };
 use publisher_platforms::upload_progress::UploadProgress;
 use publisher_platforms::wechat_channels::CREATOR_MANAGE_URL as WECHAT_CHANNELS_MANAGE_URL;
@@ -51,6 +51,7 @@ const PRODUCT_NAME: &str = "Airs";
 const SIDEBAR_WIDTH: f32 = 184.;
 const WORKSPACE_MAX_WIDTH: f32 = 1240.;
 const WORKSPACE_PADDING: f32 = 24.;
+const COMPOSE_MAX_WIDTH: f32 = 1496.;
 
 fn workspace_content_width(window: &Window) -> f32 {
     (window.viewport_size().width.as_f32() - SIDEBAR_WIDTH).min(WORKSPACE_MAX_WIDTH)
@@ -63,6 +64,10 @@ fn workspace_frame() -> Div {
         .max_w(px(WORKSPACE_MAX_WIDTH))
         .mx_auto()
         .px(px(WORKSPACE_PADDING))
+}
+
+fn compose_frame() -> Div {
+    workspace_frame().max_w(px(COMPOSE_MAX_WIDTH))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,9 +113,10 @@ struct Publisher {
     page: Page,
     message: String,
     alias: Entity<InputState>,
-    title: Entity<InputState>,
+    title: Entity<TextareaState>,
     description: Entity<TextareaState>,
-    tags: Entity<InputState>,
+    tag_input: Entity<InputState>,
+    selected_tags: Vec<String>,
     browser: Entity<InputState>,
     selected_accounts: HashSet<String>,
     material_details: Option<String>,
@@ -123,6 +129,7 @@ struct Publisher {
     photo_preview: Option<PhotoPreview>,
     video_preview: VideoPreview,
     preview_check: Option<PreviewCheck>,
+    compose_thumbnail: Option<ComposeThumbnail>,
     compose_account_filter: Option<Platform>,
     compose_asset_picker_open: bool,
     batch_key: String,
@@ -146,6 +153,13 @@ struct AccountJobFilter {
 
 struct PreviewCheck {
     asset_id: String,
+    _task: Task<()>,
+}
+
+struct ComposeThumbnail {
+    path: std::path::PathBuf,
+    modified_ms: u128,
+    image: Option<Arc<Image>>,
     _task: Task<()>,
 }
 
@@ -252,6 +266,7 @@ impl Publisher {
             }
         })
         .detach();
+        let title = cx.new(|cx| TextareaState::new(window, cx).placeholder("作品标题"));
         let description = cx.new(|cx| TextareaState::new(window, cx).placeholder("填写作品描述"));
         let mut input = |placeholder: &'static str, cx: &mut Context<Self>| {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
@@ -270,9 +285,10 @@ impl Publisher {
             page: Page::Overview,
             message: String::new(),
             alias: input("修改此账号的显示名称", cx),
-            title: input("作品标题", cx),
+            title,
             description,
-            tags: input("用空格分隔，最多 5 个标签", cx),
+            tag_input: input("输入标签，按回车添加", cx),
+            selected_tags: Vec::new(),
             browser: input("Chrome 可执行程序的完整路径", cx),
             selected_accounts: HashSet::new(),
             material_details: None,
@@ -285,6 +301,7 @@ impl Publisher {
             photo_preview: None,
             video_preview: VideoPreview::default(),
             preview_check: None,
+            compose_thumbnail: None,
             compose_account_filter: None,
             compose_asset_picker_open: false,
             batch_key: new_key(),
@@ -299,17 +316,21 @@ impl Publisher {
             confirming_delete_job: None,
             _subscriptions: Vec::new(),
         };
-        for field in [&view.title, &view.tags] {
+        for field in [&view.title, &view.description] {
             view._subscriptions
                 .push(cx.subscribe(field, |s, _, event: &InputEvent, cx| {
                     s.compose_input_changed(event, cx);
                 }));
         }
-        view._subscriptions.push(
-            cx.subscribe(&view.description, |s, _, event: &InputEvent, cx| {
-                s.compose_input_changed(event, cx)
-            }),
-        );
+        view._subscriptions.push(cx.subscribe_in(
+            &view.tag_input,
+            window,
+            |s, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => s.add_typed_tags(window, cx),
+                InputEvent::Change => s.compose_input_changed(event, cx),
+                _ => {}
+            },
+        ));
         view
     }
 
@@ -774,6 +795,13 @@ impl Publisher {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let role_selection = platform == Platform::Kuaishou;
+        let login_sms = preview
+            .douyin_login_sms
+            .as_ref()
+            .filter(|_| platform == Platform::Douyin);
+        let sms_step = login_sms.map(|sms| sms.step);
+        let sms_instructions = login_sms.and_then(|sms| sms.instructions.as_ref());
+        let show_input = !role_selection && sms_step.is_none();
         let panel = v_flex()
             .items_start()
             .gap_3()
@@ -791,6 +819,63 @@ impl Publisher {
                         Platform::WechatChannels => "完成视频号登录验证",
                         _ => "完成抖音安全验证",
                     }),
+            )
+            .when_some(sms_instructions, |panel, sms| {
+                panel
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(INK))
+                            .child("请用抖音绑定的手机号发送这条短信，发完再回来确认。"),
+                    )
+                    .child(
+                        h_flex().w_full().flex_wrap().gap_3().children(
+                            [
+                                ("短信内容", sms.message.clone()),
+                                ("收件号码", sms.recipient.clone()),
+                            ]
+                            .map(|(label, value)| {
+                                v_flex()
+                                    .min_w(px(158.))
+                                    .gap_1()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .bg(rgb(SURFACE))
+                                    .child(div().text_sm().text_color(rgb(MUTED)).child(label))
+                                    .child(
+                                        div()
+                                            .text_size(px(24.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(INK))
+                                            .child(value),
+                                    )
+                            }),
+                        ),
+                    )
+            })
+            .when_some(
+                preview.verification_id.zip(sms_step),
+                |panel, (verification_id, step)| {
+                    let account_id = account_id.to_owned();
+                    panel.child(
+                        Button::new(eid("douyin-choose-phone", panel_id))
+                            .primary()
+                            .label(match step {
+                                DouyinLoginSms::ReceiveCode => "使用手机验证码",
+                                DouyinLoginSms::SendSms => "发送短信验证",
+                                DouyinLoginSms::SmsSent => "我已发送",
+                            })
+                            .on_click(cx.listener(move |s, _, _, _| {
+                                s.backend.send(Command::VerificationInput(
+                                    account_id.clone(),
+                                    verification_id,
+                                    VerificationAction::DouyinLoginSms(step),
+                                ));
+                            })),
+                    )
+                },
             );
         let (Some(frame), Some(verification_id)) = (
             self.verification_images
@@ -821,13 +906,18 @@ impl Publisher {
             })
             .id(eid("verification-viewport", panel_id))
             .w_full()
-            .max_w(px(620.))
+            .max_w(px(if sms_step == Some(DouyinLoginSms::SmsSent) {
+                820.
+            } else {
+                620.
+            }))
             .aspect_ratio(ratio)
             .overflow_hidden()
             .rounded_lg()
             .border_1()
             .border_color(rgb(0xe2defb))
             .bg(rgb(0xffffff))
+            .cursor_pointer()
             .child(
                 img(frame.image.clone())
                     .size_full()
@@ -861,22 +951,31 @@ impl Publisher {
                 }),
             );
         panel
-            .child(
+            .when(sms_instructions.is_none(), |panel| {
+                panel.child(
                 div()
                     .text_sm()
                     .text_color(rgb(0x635c78))
                     .child(if role_selection {
                         "在下方选择本次登录的角色，再点击「确定」。"
+                    } else if let Some(step) = sms_step {
+                        match step {
+                            DouyinLoginSms::SmsSent => {
+                                "请用绑定的手机按下方说明发送短信，再点「我已发送」。"
+                            }
+                            _ => "也可在下方选择抖音提供的其他验证方式。",
+                        }
                     } else if platform == Platform::Xiaohongshu {
                         "按小红书页面提示登录。先点手机号或验证码输入框，再从这里填入。"
                     } else {
                         "按下方网页提示操作。需要输入时，先点网页里的输入框，再在这里输入或粘贴。"
                     }),
             )
+            })
             .when_some(
                 self.verification_inputs
                     .get(account_id)
-                    .filter(|_| !role_selection),
+                    .filter(|_| show_input),
                 |panel, (input, _)| {
                     let fill_account = account_id.to_string();
                     let fill_input = input.clone();
@@ -906,7 +1005,7 @@ impl Publisher {
             .when_some(
                 preview
                     .input_feedback
-                    .or_else(|| (!role_selection).then_some("填入后，在下方网页继续验证。")),
+                    .or_else(|| show_input.then_some("填入后，在下方网页继续验证。")),
                 |panel, feedback| {
                     panel.child(div().text_sm().text_color(rgb(0x635c78)).child(feedback))
                 },
@@ -1183,15 +1282,9 @@ impl Publisher {
         };
         Some(Content {
             asset,
-            title: self.title.read(cx).value().to_string(),
+            title: self.compose_title(cx),
             description: self.description.read(cx).value().to_string(),
-            tags: self
-                .tags
-                .read(cx)
-                .value()
-                .split_whitespace()
-                .map(str::to_string)
-                .collect(),
+            tags: self.compose_tags(cx),
             douyin_video_covers,
         })
     }
@@ -1622,7 +1715,10 @@ impl Publisher {
             Page::Overview => self.overview(window, cx),
             Page::Accounts => self.accounts(window, cx),
             Page::Assets => self.material_library(cx).into_any_element(),
-            Page::Compose => self.compose(window, cx),
+            Page::Compose => {
+                self.update_compose_thumbnail(cx);
+                self.compose(window, cx)
+            }
             Page::Jobs => {
                 let jobs: Vec<_> = self
                     .snapshot
@@ -2440,6 +2536,11 @@ impl Render for Publisher {
         let previewing_photos = photo_gallery.is_some();
         let body = photo_gallery.map_or_else(|| self.body(window, cx), Div::into_any_element);
         let fill_viewport = self.page == Page::Overview && !previewing_photos;
+        let frame = if self.page == Page::Compose && !previewing_photos {
+            compose_frame()
+        } else {
+            workspace_frame()
+        };
         let sms_notice = self.publish_sms_notice(cx);
         let has_notice = sms_notice.is_some() || !self.message.is_empty();
         let mut workspace = v_flex().flex_1().h_full().min_w_0();
@@ -2487,7 +2588,7 @@ impl Render for Publisher {
                 .min_h_0()
                 .when(!fill_viewport, |viewport| viewport.overflow_y_scroll())
                 .child(
-                    workspace_frame()
+                    frame
                         .when(fill_viewport, |frame| frame.h_full().min_h_0())
                         .pt(px(if has_notice { 12. } else { 24. }))
                         .pb_6()

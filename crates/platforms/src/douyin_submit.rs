@@ -1,4 +1,5 @@
 use crate::douyin::{PHOTO_FILE_SELECTOR, PHOTO_PAGE_SCRIPT, PhotoSnapshot};
+use crate::douyin_video_topics::VIDEO_TEXT_CHECK;
 use anyhow::Result;
 use chromiumoxide::{Page, layout::Point};
 use publisher_core::{Content, MediaKind, UserError};
@@ -6,7 +7,7 @@ use publisher_core::{Content, MediaKind, UserError};
 const CREATOR_ORIGIN: &str = "https://creator.douyin.com";
 const UPLOAD_PROBE: &str = include_str!("douyin_upload_page.js");
 
-const PUBLISH_TARGET: &str = r#"(origin, title, description, scroll, photos, photoSelector, uploadProbe, photoProbe) => {
+const PUBLISH_TARGET: &str = r#"(origin, title, description, scroll, photos, photoSelector, tags, uploadProbe, photoProbe, checkVideoText) => {
   if (location.origin !== origin ||
       (!photos && !['/creator-micro/content/publish', '/creator-micro/content/post/video']
         .includes(location.pathname.replace(/\/$/, '')))) {
@@ -49,9 +50,11 @@ const PUBLISH_TARGET: &str = r#"(origin, title, description, scroll, photos, pho
     const titles = present('input[placeholder*="填写作品标题"]');
     const descriptions = present('div.zone-container[contenteditable="true"]');
     if (titles.length !== 1 || descriptions.length !== 1 ||
-        titles[0].value !== title || descriptions[0].innerText.trim() !== description.trim()) {
+        titles[0].value !== title) {
       return { status: 'contentChanged' };
     }
+    const textStatus = checkVideoText(descriptions[0], description, tags);
+    if (textStatus !== 'ready') return { status: textStatus };
   }
 
   const buttons = present('button, [role="button"], input[type="submit"], input[type="button"]')
@@ -63,7 +66,7 @@ const PUBLISH_TARGET: &str = r#"(origin, title, description, scroll, photos, pho
   if (!scroll) return { status: 'ready' };
 
   const button = buttons[0];
-  button.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+  button.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'nearest' });
   const bounds = button.getBoundingClientRect();
   const x = bounds.left + bounds.width / 2;
   const y = bounds.top + bounds.height / 2;
@@ -80,6 +83,7 @@ enum PublishCheck {
     Blocked,
     UploadNotReady,
     ContentChanged,
+    TopicsChanged,
     PhotosChanged,
     SettingsChanged,
     PublishUnavailable,
@@ -116,13 +120,19 @@ async fn inspect_target(
     let arguments = serde_json::json!([
         origin,
         content.title,
-        prepared_description(content),
+        if photos.is_some() {
+            prepared_description(content)
+        } else {
+            content.description.clone()
+        },
         scroll,
         photos,
         PHOTO_FILE_SELECTOR,
+        content.tags,
     ]);
-    let expression =
-        format!("({PUBLISH_TARGET})(...{arguments}, ({UPLOAD_PROBE}), ({PHOTO_PAGE_SCRIPT}))");
+    let expression = format!(
+        "({PUBLISH_TARGET})(...{arguments}, ({UPLOAD_PROBE}), ({PHOTO_PAGE_SCRIPT}), ({VIDEO_TEXT_CHECK}))"
+    );
     let check = page
         .evaluate_expression(expression)
         .await
@@ -134,6 +144,7 @@ async fn inspect_target(
         PublishCheck::Blocked => "抖音发布页有待处理的提示、必填项或遮挡，请先在平台核对。",
         PublishCheck::UploadNotReady => "抖音尚未确认素材上传完成，请重新准备作品。",
         PublishCheck::ContentChanged => "抖音编辑页的标题或描述与任务记录不一致，请重新准备作品。",
+        PublishCheck::TopicsChanged => "抖音编辑页的话题关联与任务记录不一致，请重新准备作品。",
         PublishCheck::PhotosChanged => "抖音编辑页的图片或封面已变化，请重新准备作品。",
         PublishCheck::SettingsChanged => {
             "抖音编辑页的发布时间或可见范围已变化，请先在创作者中心核对。"
@@ -184,6 +195,7 @@ mod tests {
     use super::*;
     use crate::browser::{BrowserSession, fill_fields, truth};
     use crate::douyin::{photo_expression, select_photos};
+    use crate::douyin_video_topics::prepare_video_text;
     use publisher_core::Asset;
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -218,7 +230,7 @@ mod tests {
             asset: Asset::inspect(&asset)?,
             title: "短片".into(),
             description: "正文".into(),
-            tags: vec!["测试".into()],
+            tags: vec!["gta".into(), "GTA6".into()],
             douyin_video_covers: Default::default(),
         };
         let mut browser = BrowserSession::launch(profile.path()).await?;
@@ -236,7 +248,43 @@ mod tests {
             <button disabled>发布</button>
             <button hidden>发布</button>
             <script>
+              const editor = document.querySelector('.zone-container');
+              const suggestions = document.createElement('div');
+              editor.after(suggestions);
+              let suggestionTimer;
+              editor.addEventListener('input', () => {
+                clearTimeout(suggestionTimer);
+                const tail = /#([a-z0-9]+)$/i.exec(editor.innerText);
+                suggestions.replaceChildren();
+                if (!tail || !['gta', 'gta6'].includes(tail[1].toLowerCase())) return;
+                suggestionTimer = setTimeout(() => {
+                  for (const name of ['GTA6', 'GTA']) {
+                    const option = document.createElement('button');
+                    const label = document.createElement('span');
+                    label.className = 'tag-hash-view-name-fixture';
+                    label.textContent = name;
+                    option.append(label);
+                    option.onclick = () => {
+                      window.topicSelections++;
+                      const text = editor.lastChild;
+                      const range = new Range();
+                      range.setStart(text, text.length - tail[0].length);
+                      range.setEnd(text, text.length);
+                      range.deleteContents();
+                      const topic = document.createElement('span');
+                      topic.dataset.mention = '#';
+                      topic.contentEditable = 'false';
+                      topic.textContent = '#' + name;
+                      range.insertNode(topic);
+                      editor.append(' ');
+                      suggestions.replaceChildren();
+                    };
+                    suggestions.append(option);
+                  }
+                }, 250);
+              });
               window.publishClicks = [];
+              window.topicSelections = 0;
               document.querySelector('#publish').addEventListener('click',
                 (event) => window.publishClicks.push(event.isTrusted));
             </script>
@@ -245,7 +293,31 @@ mod tests {
         .await?;
         fill_fields(&page, &content.title, &prepared_description(&content)).await?;
         assert!(preflight(&page, &content, None).await.is_err());
+        let plain = inspect_target(&page, &origin, &content, None, false)
+            .await
+            .unwrap_err();
+        assert!(plain.to_string().contains("话题关联"));
+        prepare_video_text(&page, &origin, &content).await?;
+        prepare_video_text(&page, &origin, &content).await?;
+        assert!(truth(&page, "window.topicSelections === 2").await?);
+        assert!(truth(
+            &page,
+            r##"Array.from(document.querySelectorAll('[data-mention="#"]'), node => node.innerText).join(' ') === '#GTA #GTA6'"##,
+        ).await?);
         inspect_target(&page, &origin, &content, None, false).await?;
+        page.evaluate(
+            r#"document.querySelector('[data-mention]').removeAttribute('data-mention')"#,
+        )
+        .await?;
+        assert!(
+            inspect_target(&page, &origin, &content, None, false)
+                .await
+                .is_err()
+        );
+        page.evaluate(
+            r#"document.querySelector('.zone-container span').setAttribute('data-mention', '#')"#,
+        )
+        .await?;
         assert!(
             truth(
                 &page,
@@ -292,6 +364,62 @@ mod tests {
             truth(
                 &page,
                 "window.publishClicks.length === 1 && window.publishClicks[0] === true"
+            )
+            .await?
+        );
+        browser.close().await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "需要本机 Chrome"]
+    async fn publish_scroll_keeps_button_clear_of_fixed_sidebar() -> Result<()> {
+        let (origin, server) = fixture_server().await?;
+        let profile = tempfile::tempdir()?;
+        let asset = profile.path().join("fixture.mp4");
+        std::fs::write(&asset, b"fixture")?;
+        let content = Content {
+            asset: Asset::inspect(&asset)?,
+            title: "短片".into(),
+            description: "正文".into(),
+            tags: vec![],
+            douyin_video_covers: Default::default(),
+        };
+        let mut browser = BrowserSession::launch(profile.path()).await?;
+        let page = browser
+            .browser
+            .new_page(format!("{origin}/creator-micro/content/post/video"))
+            .await?;
+        page.set_content(
+            r#"
+            <style>
+              body { margin: 0; width: 250vw; height: 2400px; }
+              aside { position: fixed; inset: 0 auto 0 0; width: 55vw;
+                      background: #eee; z-index: 10; }
+              #publish { position: absolute; left: 150vw; top: 1800px;
+                         width: 120px; height: 40px; }
+            </style>
+            <aside>导航</aside>
+            <input placeholder="填写作品标题">
+            <div class="zone-container" contenteditable="true"></div>
+            <button>重新上传视频</button>
+            <button id="publish">发布</button>
+            <script>
+              window.publishClicks = [];
+              document.querySelector('#publish').onclick = event =>
+                publishClicks.push(event.isTrusted);
+            </script>
+            "#,
+        )
+        .await?;
+        fill_fields(&page, &content.title, &content.description).await?;
+        inspect_target(&page, &origin, &content, None, false).await?;
+        click_publish_at_origin(&page, &origin, &content, None).await?;
+        assert!(
+            truth(
+                &page,
+                "window.publishClicks.length === 1 && window.publishClicks[0]"
             )
             .await?
         );

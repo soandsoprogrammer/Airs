@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS recent_tags(
+    sequence INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(5);

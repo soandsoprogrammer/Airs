@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use chromiumoxide::{Browser, BrowserConfig, Page};
+use chromiumoxide::{Browser, BrowserConfig, Page, handler::viewport::Viewport};
 use futures::StreamExt;
 use std::{
     path::{Path, PathBuf},
@@ -72,6 +72,11 @@ impl BrowserSession {
             .chrome_executable(path)
             .user_data_dir(profile)
             .new_headless_mode()
+            .viewport(Viewport {
+                width: 1440,
+                height: 1000,
+                ..Default::default()
+            })
             .request_timeout(Duration::from_secs(30))
             .arg("--no-first-run")
             .arg("--no-default-browser-check");
@@ -124,6 +129,7 @@ pub async fn upload_file(page: &Page, selector: &str, path: &Path) -> Result<()>
     Ok(())
 }
 pub async fn fill_fields(page: &Page, title: &str, description: &str) -> Result<()> {
+    let description_text = description;
     let title = serde_json::to_string(title)?;
     let description = serde_json::to_string(description)?;
     let script = format!(
@@ -133,13 +139,54 @@ pub async fn fill_fields(page: &Page, title: &str, description: &str) -> Result<
  if(!input||!editor) return false;
  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,{title});
  input.dispatchEvent(new Event('input',{{bubbles:true}})); input.dispatchEvent(new Event('change',{{bubbles:true}}));
- editor.focus(); document.execCommand('selectAll',false); document.execCommand('insertText',false,{description});
- editor.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{description}}}));
- return input.value==={title} && editor.innerText.trim()==={description}.trim();
+ const clean=(value)=>value.replace(/\u200b/g,'').trim();
+ if(clean(editor.innerText)!==clean({description})) {{
+   editor.focus();
+   const range=document.createRange(); range.selectNodeContents(editor);
+   const selection=getSelection();
+   if(!selection) return false;
+   selection.removeAllRanges(); selection.addRange(range);
+ }}
+ return true;
  }})()"#
     );
     ensure!(
         truth(page, &script).await?,
+        "平台编辑区域已变化，无法确认标题和描述已填写"
+    );
+    let verification = format!(
+        r#"(() => {{
+          const input=document.querySelector('input[placeholder*="填写作品标题"]');
+          const editor=document.querySelector('div.zone-container[contenteditable="true"]');
+          const clean=value=>value.replace(/\u200b/g,'').trim();
+          return !!input && !!editor && input.value==={title} &&
+            clean(editor.innerText)===clean({description});
+        }})()"#
+    );
+    if !truth(page, &verification).await? {
+        if description_text.is_empty() {
+            page.find_element("div.zone-container[contenteditable=\"true\"]")
+                .await?
+                .press_key("Backspace")
+                .await?;
+        } else {
+            page.execute(
+                chromiumoxide::cdp::browser_protocol::input::InsertTextParams::new(
+                    description_text,
+                ),
+            )
+            .await?;
+        }
+    }
+    let verified = tokio::time::timeout(Duration::from_secs(2), async {
+        while !truth(page, &verification).await? {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    ensure!(
+        matches!(verified, Ok(Ok(()))),
         "平台编辑区域已变化，无法确认标题和描述已填写"
     );
     Ok(())

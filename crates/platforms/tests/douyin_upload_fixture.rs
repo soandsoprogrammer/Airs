@@ -7,14 +7,45 @@ const UPLOAD: &str = "/creator-micro/content/upload";
 const PUBLISH: &str = "/creator-micro/content/publish?enter_from=publish_page";
 const POST_VIDEO: &str = "/creator-micro/content/post/video?enter_from=publish_page";
 const EDITOR: &str = r#"<input placeholder="填写作品标题"><div class="zone-container" contenteditable="true">正文</div>"#;
+const PROBE: &str = include_str!("../src/douyin_upload_page.js");
+const RETRY_INPUT: &str = r#"<input hidden class="upload-btn-input-UY_qeY" type="file" name="upload-btn" accept="video/mp4,.mov,video/*" id="retry">"#;
+
+fn retry_card(input: &str) -> String {
+    format!(
+        r#"<div class="upload-card-IBCFN_"><div class="container-FNDpwE">
+        <div class="progress-nJ5tf6"><p class="progress-p">clip.mp4</p>
+        <div class="progress-div"><div class="upload-btn-PdfuUv progress-sub-ITjyPa">上传失败<span>，重新上传</span>{input}</div></div>
+        </div></div></div>"#
+    )
+}
 
 async fn upload_state(page: &Page, origin: &str) -> anyhow::Result<Value> {
-    let script = include_str!("../src/douyin_upload_page.js");
     let origin = serde_json::to_string(origin)?;
     Ok(page
-        .evaluate_expression(format!("({script})({origin})"))
+        .evaluate_expression(format!("({PROBE})({origin})"))
         .await?
         .into_value()?)
+}
+
+async fn retry_input(page: &Page, origin: &str) -> anyhow::Result<Option<String>> {
+    let origin = serde_json::to_string(origin)?;
+    let probe: Value = page
+        .evaluate_expression(format!(
+            "({{ id: (({PROBE})({origin}, true))?.id ?? null }})"
+        ))
+        .await?
+        .into_value()?;
+    Ok(probe.get("id").and_then(Value::as_str).map(str::to_owned))
+}
+
+async fn show(page: &Page, path: &str, body: &str) -> anyhow::Result<()> {
+    let path = serde_json::to_string(path)?;
+    let body = serde_json::to_string(body)?;
+    page.evaluate_expression(format!(
+        "history.replaceState(null, '', {path}); document.body.innerHTML = {body};"
+    ))
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -253,13 +284,8 @@ async fn upload_ready_requires_visible_completion_and_editor() -> anyhow::Result
         ),
     ];
     for (case, path, markup, has_editor, status, percent) in cases {
-        let path = serde_json::to_string(path)?;
         let suffix = if has_editor { EDITOR } else { "" };
-        let body = serde_json::to_string(&format!("{markup}{suffix}"))?;
-        page.evaluate_expression(format!(
-            "history.replaceState(null, '', {path}); document.body.innerHTML = {body};"
-        ))
-        .await?;
+        show(&page, path, &format!("{markup}{suffix}")).await?;
         assert_eq!(
             upload_state(&page, &origin).await?,
             json!({"status": status, "percent": percent}),
@@ -270,6 +296,149 @@ async fn upload_ready_requires_visible_completion_and_editor() -> anyhow::Result
         upload_state(&page, "https://creator.douyin.com").await?,
         json!({"status": "waiting", "percent": null})
     );
+
+    let retry = retry_card(RETRY_INPUT);
+    let decoy = r#"<input id="other-video" type="file" accept="video/*"><input id="cover" type="file" accept="image/*">"#;
+    let hidden_retry = format!("<div hidden>{retry}</div>");
+    let disabled = retry_card(&RETRY_INPUT.replace("hidden", "hidden disabled"));
+    let bogus_input = retry_card(&RETRY_INPUT.replace("video/mp4,.mov,video/*", "image/*"));
+    let nested_input = retry_card(&format!("<div>{RETRY_INPUT}</div>"));
+    let duplicate_inputs = retry_card(&format!(
+        "{RETRY_INPUT}{}",
+        RETRY_INPUT.replace("id=\"retry\"", "id=\"duplicate\"")
+    ));
+    let preparation_cases = [
+        (
+            "official failure CTA selects only its direct video input",
+            POST_VIDEO,
+            format!("{decoy}{retry}{hidden_retry}"),
+            json!({"status": "retryable", "percent": null}),
+            Some("retry"),
+        ),
+        (
+            "a network reason can accompany an eligible retry",
+            PUBLISH,
+            format!(r#"{retry}<div role="alert">视频上传失败，网络异常，请重试</div>"#),
+            json!({"status": "retryable", "percent": null, "failure": "network"}),
+            Some("retry"),
+        ),
+        (
+            "two visible retry controls make selection ambiguous",
+            POST_VIDEO,
+            format!("{retry}{disabled}"),
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "two direct retry inputs make selection ambiguous",
+            POST_VIDEO,
+            duplicate_inputs,
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "the disabled retry input is unavailable",
+            POST_VIDEO,
+            disabled,
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "an image file input cannot replace the video",
+            POST_VIDEO,
+            bogus_input,
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "a file input nested below the official control is unavailable",
+            POST_VIDEO,
+            nested_input,
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "a hidden retry control cannot be used",
+            POST_VIDEO,
+            format!("{hidden_retry}{decoy}"),
+            json!({"status": "waiting", "percent": null}),
+            None,
+        ),
+        (
+            "retry cannot run on the uploader landing route",
+            UPLOAD,
+            retry.clone(),
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "login dialog takes precedence over the retry control",
+            POST_VIDEO,
+            format!(r#"{retry}<div role="dialog">请重新登录</div>"#),
+            json!({"status": "needsLogin", "percent": null}),
+            None,
+        ),
+        (
+            "file rejection does not allow a retry",
+            POST_VIDEO,
+            format!(r#"{retry}<div role="alert">视频格式不支持，请更换文件</div>"#),
+            json!({"status": "failed", "percent": null, "failure": "file"}),
+            None,
+        ),
+        (
+            "processing rejection does not allow a retry",
+            POST_VIDEO,
+            format!(r#"{retry}<div role="alert">视频文件解码失败，请更换文件</div>"#),
+            json!({"status": "failed", "percent": null, "failure": "processing"}),
+            None,
+        ),
+        (
+            "a service error without a retry input remains failed",
+            POST_VIDEO,
+            r#"<div role="alert">上传失败，服务器繁忙</div>"#.to_owned(),
+            json!({"status": "failed", "percent": null, "failure": "service"}),
+            None,
+        ),
+        (
+            "a failure message by itself cannot select another input",
+            POST_VIDEO,
+            format!(r#"<div role="alert">视频上传失败，请稍后重试</div>{decoy}"#),
+            json!({"status": "failed", "percent": null}),
+            None,
+        ),
+        (
+            "official decoding markup is processing",
+            POST_VIDEO,
+            r#"<div class="upload-card-IBCFN_"><div class="encoding-jbSjaQ"><div><div class="loading-M_XtMr">视频解码中...</div><div>取消上传</div></div></div></div><button>重新上传</button>"#.to_owned(),
+            json!({"status": "processing", "percent": null}),
+            None,
+        ),
+        (
+            "unrelated errors and preview transcode output do not authorize upload retry",
+            POST_VIDEO,
+            r#"<div role="alert">封面上传失败，请重试。</div><div role="alert">网络异常</div><div class="transend-tip">预览失败</div><p>作品已成功上传</p><button>重新上传</button>"#.to_owned(),
+            json!({"status": "ready", "percent": null}),
+            None,
+        ),
+    ];
+    for (case, path, markup, expected, input) in preparation_cases {
+        show(&page, path, &format!("{markup}{EDITOR}")).await?;
+        assert_eq!(upload_state(&page, &origin).await?, expected, "{case}");
+        assert_eq!(
+            retry_input(&page, &origin).await?.as_deref(),
+            input,
+            "{case}"
+        );
+    }
+    show(&page, POST_VIDEO, &retry).await?;
+    assert_eq!(
+        retry_input(&page, "https://creator.douyin.com").await?,
+        None
+    );
+    assert_eq!(retry_input(&page, &origin).await?.as_deref(), Some("retry"));
+    page.evaluate_expression("document.getElementById('retry').disabled = true")
+        .await?;
+    assert_eq!(retry_input(&page, &origin).await?, None);
 
     browser.close().await?;
     server.abort();

@@ -3,6 +3,7 @@ pub mod douyin;
 mod douyin_publish_verification;
 pub mod douyin_receipt;
 pub mod douyin_submit;
+mod douyin_video_topics;
 pub mod kuaishou;
 mod kuaishou_prepare;
 mod kuaishou_receipt;

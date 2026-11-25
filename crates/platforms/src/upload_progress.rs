@@ -7,6 +7,7 @@ use std::{
 pub enum UploadProgress {
     ValidatingFile,
     Uploading { percent: Option<u8> },
+    Retrying,
     Processing,
     EditorMissing,
     FillingForm,

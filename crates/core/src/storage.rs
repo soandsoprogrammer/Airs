@@ -51,6 +51,7 @@ impl Store {
         connection.execute_batch(include_str!("../../../migrations/002_removed_accounts.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/003_removed_jobs.sql"))?;
         connection.execute_batch(include_str!("../../../migrations/004_material_sets.sql"))?;
+        connection.execute_batch(include_str!("../../../migrations/005_recent_tags.sql"))?;
         Ok(s)
     }
     fn conn(&self) -> Result<Connection> {
@@ -293,12 +294,44 @@ impl Store {
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
     pub fn save_draft(&self, id: &str, content: &Content) -> Result<()> {
-        self.conn()?.execute(
+        let mut connection = self.conn()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO drafts VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
             params![id, serde_json::to_string(content)?],
         )?;
+        Self::remember_tags(&tx, &content.tags)?;
+        tx.commit()?;
         Ok(())
     }
+
+    fn remember_tags(connection: &Connection, tags: &[String]) -> Result<()> {
+        for tag in tags
+            .iter()
+            .rev()
+            .filter(|tag| !tag.is_empty() && tag.chars().all(|c| !c.is_whitespace() && c != '#'))
+        {
+            connection.execute("INSERT OR REPLACE INTO recent_tags(tag) VALUES(?1)", [tag])?;
+        }
+        if !tags.is_empty() {
+            connection.execute(
+                "DELETE FROM recent_tags WHERE sequence NOT IN (
+                    SELECT sequence FROM recent_tags ORDER BY sequence DESC LIMIT 48
+                )",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn recent_tags(&self) -> Result<Vec<String>> {
+        let connection = self.conn()?;
+        let mut query = connection.prepare("SELECT tag FROM recent_tags ORDER BY sequence DESC")?;
+        Ok(query
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn draft(&self, id: &str) -> Result<Option<Content>> {
         let raw: Option<String> = self
             .conn()?
@@ -372,6 +405,7 @@ impl Store {
             )?;
             jobs.push(j);
         }
+        Self::remember_tags(&tx, &content.tags)?;
         tx.commit()?;
         Ok(jobs)
     }

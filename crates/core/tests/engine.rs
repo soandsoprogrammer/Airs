@@ -180,6 +180,79 @@ async fn ambiguous_result_is_never_retried() {
     assert!(e.submit(&j.id).is_err());
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
+
+#[derive(Clone)]
+struct RejectedSubmission {
+    user_facing: bool,
+}
+
+#[async_trait]
+impl PlatformAdapter for RejectedSubmission {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            name: "提交失败夹具",
+            verified: false,
+            separate_prepare: true,
+            custom_cover: false,
+            submit_enabled: true,
+            image_posts: false,
+        }
+    }
+
+    async fn login(&self, _: &Store, _: &Account, _: CancellationToken) -> Result<SessionStatus> {
+        Ok(SessionStatus::Ready)
+    }
+
+    async fn prepare(&self, _: RunContext) -> Result<Box<dyn Prepared>> {
+        Ok(Box::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl Prepared for RejectedSubmission {
+    async fn submit(&mut self) -> Result<()> {
+        if self.user_facing {
+            Err(UserError("抖音发布页有待处理的提示，请先在平台核对。".into()).into())
+        } else {
+            anyhow::bail!("internal transport error containing a private token")
+        }
+    }
+
+    async fn inspect_result(&mut self) -> Result<Option<Receipt>> {
+        panic!("a failed submission must not inspect a receipt")
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn submission_failure_preserves_user_explanation_and_hides_internal_errors() {
+    for user_facing in [true, false] {
+        let (_dir, store, _, job, _) = setup(false);
+        let adapter = Arc::new(RejectedSubmission { user_facing });
+        let engine = Engine::new(store.clone(), vec![(job.account.platform, adapter)]);
+        engine.start(job.id.clone()).unwrap();
+        wait(&store, &job.id, JobState::WaitingUser).await;
+        engine.submit(&job.id).unwrap();
+        wait(&store, &job.id, JobState::Unknown).await;
+
+        let failed = store.job(&job.id).unwrap();
+        assert_eq!(
+            failed.message.contains("抖音发布页有待处理的提示"),
+            user_facing
+        );
+        assert!(!failed.message.contains("private token"));
+        assert!(failed.message.contains("提交结果待确认"));
+        assert!(engine.resume(job.id.clone()).is_err());
+        assert!(engine.submit(&job.id).is_err());
+        assert_eq!(
+            store.events(&job.id).unwrap().last().unwrap().message,
+            failed.message
+        );
+    }
+}
 #[tokio::test]
 async fn cancel_at_prepare_boundary_does_not_submit() {
     let (_dir, s, e, j, count) = setup(false);

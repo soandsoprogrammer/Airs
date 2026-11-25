@@ -339,12 +339,14 @@ impl Engine {
             Ok(Some(receipt)) => {
                 self.store.received(&job.id, receipt)?;
             }
-            _ => {
-                self.store.transition(
-                    &job.id,
-                    JobState::Unknown,
-                    "提交结果待确认，请到平台核对；不会自动重发",
-                )?;
+            result => {
+                let message = result
+                    .err()
+                    .and_then(|error| error.downcast::<UserError>().ok())
+                    .map(|error| format!("{} 提交结果待确认，请到平台核对；不会自动重发", error.0))
+                    .unwrap_or_else(|| "提交结果待确认，请到平台核对；不会自动重发".into());
+                self.store
+                    .transition(&job.id, JobState::Unknown, &message)?;
             }
         }
         Ok(())

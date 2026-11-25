@@ -30,6 +30,7 @@ pub struct Snapshot {
     pub image_enabled_platforms: Vec<Platform>,
     pub submit_enabled_platforms: Vec<Platform>,
     pub draft: Option<Content>,
+    pub recent_tags: Vec<String>,
     pub browser: String,
 }
 impl Snapshot {
@@ -133,6 +134,24 @@ impl Worker {
                 Some((platform, self.engine.adapter(platform).ok()?.capabilities()))
             })
             .collect();
+        let draft = self.store.draft("composer")?;
+        let mut recent_tags = self.store.recent_tags()?;
+        let mut seen: HashSet<_> = recent_tags
+            .iter()
+            .map(|tag| tag.to_ascii_lowercase())
+            .collect();
+        for tag in draft
+            .iter()
+            .flat_map(|draft| &draft.tags)
+            .chain(jobs.iter().flat_map(|job| &job.content.tags))
+        {
+            if seen.insert(tag.to_ascii_lowercase()) {
+                recent_tags.push(tag.clone());
+            }
+            if recent_tags.len() >= 48 {
+                break;
+            }
+        }
         let snap = Snapshot {
             accounts: self.accounts()?,
             material_sets: self.store.material_sets()?,
@@ -154,7 +173,8 @@ impl Worker {
                 .iter()
                 .filter_map(|(platform, cap)| cap.image_posts.then_some(*platform))
                 .collect(),
-            draft: self.store.draft("composer")?,
+            draft,
+            recent_tags,
             browser,
         };
         let _ = self.updates.send(Update::Snapshot(Box::new(snap)));
@@ -326,7 +346,9 @@ impl Worker {
                     let _ = updates.send(Update::Message(message));
                     logins.lock().unwrap().remove(&id);
                 });
-                Ok(if platform == Platform::Xiaohongshu {
+                Ok(if platform == Platform::Douyin {
+                    "请在账号详情中完成抖音登录，遇到身份验证时可在应用内选择验证方式。"
+                } else if platform == Platform::Xiaohongshu {
                     "正在检查小红书登录状态。需要登录时，会在账号详情中显示登录页。"
                 } else {
                     "正在后台检查登录状态。需要扫码时，二维码会显示在账号详情中。"
@@ -350,6 +372,9 @@ impl Worker {
                 let feedback_on_failure = match &action {
                     VerificationAction::FillText(_) => {
                         Some("暂时无法填入文字，请检查验证页面后重试")
+                    }
+                    VerificationAction::DouyinLoginSms(_) => {
+                        Some("抖音验证选项已变化，请查看当前页面")
                     }
                     VerificationAction::RequestSmsCode | VerificationAction::VerifySmsCode(_) => {
                         Some("短信验证页面已变化，请查看任务状态")

@@ -13,11 +13,20 @@
 
   const visible = (element) =>
     element?.getClientRects().length > 0 && getComputedStyle(element).visibility === 'visible';
+  const verificationMessage = /身份验证|安全验证|手机(?:号码?)?(?:短信)?验证|短信(?:验证码)?验证/;
+  const activeVerification = [...document.querySelectorAll(
+    '.second-verify-panel, dialog, [role="dialog"], [aria-modal="true"]'
+  )].some((panel) => visible(panel) && !panel.closest('[hidden], [aria-hidden="true"], [inert]') &&
+    (verificationMessage.test(panel.innerText ?? '') ||
+      [...panel.querySelectorAll('.uc-ui-verify_sms-verify input[placeholder*="验证码"]')].some(visible)));
+  if (activeVerification) {
+    return { ...empty, needsInteraction: true, qrStatus: 'verifyInApp' };
+  }
   // These messages can replace the QR or overlay an image left in the DOM.
   if (/二维码(?:已)?(?:失效|过期)/.test(text)) {
     return { ...empty, needsInteraction: true, qrStatus: 'expired' };
   }
-  if (/安全验证|身份验证|短信验证|手机验证|滑动滑块/.test(text)) {
+  if (verificationMessage.test(text) || /滑动滑块/.test(text)) {
     return { ...empty, needsInteraction: true, qrStatus: 'verifyInApp' };
   }
   if (/扫码成功|扫描成功|已扫码|手机端确认|在手机上确认|在抖音\s*App\s*中确认|请确认登录/.test(text)) {

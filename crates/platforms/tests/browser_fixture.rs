@@ -15,6 +15,10 @@ async fn cdp_upload_fill_dialog_and_cleanup_without_submission() -> anyhow::Resu
         .browser
         .new_page(format!("file://{}", fixture.display()))
         .await?;
+    assert!(
+        truth(&page, "innerWidth >= 1280 && innerHeight >= 720").await?,
+        "creator pages need room for their desktop editor and fixed navigation"
+    );
     upload_file(&page, "input[type=file]", &video).await?;
     assert!(truth(&page, "document.querySelector('#dialog').open").await?);
     page.evaluate("document.querySelector('#dialog').close()")
@@ -33,6 +37,18 @@ async fn cdp_upload_fill_dialog_and_cleanup_without_submission() -> anyhow::Resu
         Some("平台昵称测试")
     );
     assert!(truth(&page,"document.querySelector('input[type=file]').files.length===1 && submitted===0 && document.querySelector('#result').textContent==='上传已接收'").await?);
+    page.evaluate_expression(
+        r##"document.querySelector('.zone-container').innerHTML = '旧正文 <span contenteditable="false" data-mention="#">#旧话题</span> <span contenteditable="false" data-mention="#">#另一话题</span>'"##,
+    )
+    .await?;
+    fill_fields(&page, "重新准备", "替换后的正文").await?;
+    assert!(
+        truth(
+            &page,
+            "document.querySelector('.zone-container').innerText === '替换后的正文' && document.querySelectorAll('[data-mention]').length === 0 && submitted === 0"
+        )
+        .await?
+    );
     session.close().await?;
     Ok(())
 }

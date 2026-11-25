@@ -2,7 +2,10 @@ use crate::browser::*;
 pub use crate::douyin_publish_verification::relay_publish_verification;
 use crate::douyin_receipt::DouyinReceiptObserver;
 use crate::douyin_submit::{click_publish, preflight, prepared_description};
-use crate::sign_in::{SignInGuard, SignInStatus, SignIns, VerificationAction};
+use crate::douyin_video_topics::prepare_video_text;
+use crate::sign_in::{
+    DouyinLoginSms, DouyinLoginSmsPreview, SignInGuard, SignInStatus, SignIns, VerificationAction,
+};
 use crate::upload_progress::{UploadProgress, UploadProgressGuard, UploadProgressRegistry};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -44,17 +47,15 @@ static CREATOR_PAGE_SCRIPT: LazyLock<String> = LazyLock::new(|| {
         include_str!("douyin_creator_page.js")
     )
 });
-static UPLOAD_PAGE_SCRIPT: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "({})({CREATOR_ORIGIN:?})",
-        include_str!("douyin_upload_page.js")
-    )
-});
+const UPLOAD_PAGE_SCRIPT: &str = include_str!("douyin_upload_page.js");
+const LOGIN_PHONE_SCRIPT: &str = include_str!("douyin_login_phone.js");
+const RETRY_START_WAIT: Duration = Duration::from_secs(8);
+const VIDEO_UPLOAD_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
+const VIDEO_UPLOAD_STALL_LIMIT: Duration = Duration::from_secs(10 * 60);
 
-fn upload_timeout(bytes: u64) -> Duration {
+fn initial_upload_timeout(bytes: u64) -> Duration {
     const MIB: u64 = 1024 * 1024;
-    // Budget one second per MiB, plus time for the platform to process the video.
-    Duration::from_secs((600 + bytes.div_ceil(MIB)).min(2 * 60 * 60))
+    Duration::from_secs(600 + bytes.div_ceil(MIB)).min(VIDEO_UPLOAD_LIMIT)
 }
 
 #[derive(Default)]
@@ -92,6 +93,7 @@ enum UploadStatus {
     EditorMissing,
     Ready,
     Failed,
+    Retryable,
     NeedsLogin,
 }
 
@@ -99,6 +101,16 @@ enum UploadStatus {
 struct UploadObservation {
     status: UploadStatus,
     percent: Option<serde_json::Value>,
+    failure: Option<UploadFailure>,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum UploadFailure {
+    Network,
+    File,
+    Processing,
+    Service,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -259,43 +271,154 @@ impl UploadObservation {
             UploadStatus::Processing => Some(UploadProgress::Processing),
             UploadStatus::EditorMissing => Some(UploadProgress::EditorMissing),
             UploadStatus::Ready => Some(UploadProgress::FillingForm),
-            UploadStatus::Waiting | UploadStatus::Failed | UploadStatus::NeedsLogin => None,
+            UploadStatus::Waiting
+            | UploadStatus::Failed
+            | UploadStatus::Retryable
+            | UploadStatus::NeedsLogin => None,
         }
     }
 }
 
 impl UploadStatus {
-    fn timeout_error(self) -> UserError {
-        let message = match self {
-            Self::Uploading => "等待上传超时；抖音最后一次显示视频仍在上传。",
-            Self::Processing => "等待处理超时；抖音最后一次显示视频仍在处理。",
+    fn timeout_error(self, reason: &str, percent: Option<u8>) -> UserError {
+        let status = match self {
+            Self::Uploading if percent == Some(100) => "抖音尚未确认上传完成。",
+            Self::Uploading => "抖音最后一次显示视频仍在上传。",
+            Self::Processing => "抖音最后一次显示视频仍在处理。",
             Self::EditorMissing => "抖音显示视频已上传，但未找到作品编辑框。",
-            _ => "等待超时；未能确认抖音是否已收到视频，请到创作者中心核对。",
+            _ => "未能确认抖音是否已收到视频，请到创作者中心核对。",
         };
-        UserError(format!("{message} 未执行最终提交。"))
+        UserError(format!(
+            "{reason}{status}{}未执行最终提交。",
+            last_upload_percent(percent)
+        ))
     }
+}
+
+fn last_upload_percent(percent: Option<u8>) -> String {
+    percent.map_or_else(String::new, |value| {
+        format!("最后一次显示上传进度 {value}%。")
+    })
+}
+
+struct VideoUploadActivity {
+    deadline: Instant,
+    last_percent: Option<u8>,
+    highest_percent: u8,
+    saw_processing: bool,
+}
+
+impl VideoUploadActivity {
+    fn new(now: Instant, initial_wait: Duration) -> Self {
+        Self {
+            deadline: now + initial_wait,
+            last_percent: None,
+            highest_percent: 0,
+            saw_processing: false,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, progress: Option<UploadProgress>) {
+        match progress {
+            Some(UploadProgress::Uploading {
+                percent: Some(value),
+            }) => {
+                self.last_percent = Some(value);
+                if value <= self.highest_percent {
+                    return;
+                }
+                self.highest_percent = value;
+            }
+            Some(UploadProgress::Processing) if !self.saw_processing => {
+                self.saw_processing = true;
+            }
+            _ => return,
+        }
+        self.deadline = now + VIDEO_UPLOAD_STALL_LIMIT;
+    }
+}
+
+fn upload_failure_error(
+    failure: Option<UploadFailure>,
+    percent: Option<u8>,
+    retried: bool,
+) -> UserError {
+    let reason = match failure {
+        Some(UploadFailure::Network) => "抖音提示上传连接异常。",
+        Some(UploadFailure::File) => "抖音提示视频文件不符合上传要求，请检查格式、大小或时长。",
+        Some(UploadFailure::Processing) => "抖音提示视频处理失败，请检查视频编码。",
+        Some(UploadFailure::Service) => "抖音提示服务暂不可用。",
+        None => "抖音提示上传失败，页面未说明具体原因。",
+    };
+    let progress = last_upload_percent(percent);
+    let retry = if retried {
+        "已自动重传一次。"
+    } else {
+        ""
+    };
+    UserError(format!("{reason}{retry}{progress}未执行最终提交。"))
+}
+
+async fn retry_video_upload(page: &Page, origin: &str, asset: &Asset) -> Result<bool> {
+    asset
+        .verify()
+        .map_err(|error| UserError(error.to_string()))?;
+    let path = asset
+        .path
+        .to_str()
+        .ok_or_else(|| UserError("无法读取视频路径。".into()))?;
+    let mut params = EvaluateParams::new(format!("({UPLOAD_PAGE_SCRIPT})({origin:?}, true)"));
+    params.return_by_value = Some(false);
+    let result = page.evaluate_expression(params).await?;
+    let Some(input) = result.object().object_id.clone() else {
+        return Ok(false);
+    };
+    let mut files = SetFileInputFilesParams::new(vec![path.to_owned()]);
+    files.object_id = Some(input);
+    page.execute(files).await?;
+    Ok(true)
 }
 
 async fn wait_for_uploaded_video(
     page: &Page,
+    origin: &str,
+    asset: &Asset,
     limit: Duration,
     progress: &UploadProgressGuard,
 ) -> Result<()> {
     let mut last_observed = UploadStatus::Waiting;
+    let initial_wait = initial_upload_timeout(asset.size);
+    let mut activity = VideoUploadActivity::new(Instant::now(), initial_wait);
+    let mut retried = false;
+    let observation_script = format!("({UPLOAD_PAGE_SCRIPT})({origin:?})");
     let result = tokio::time::timeout(limit, async {
         let mut failures = 0;
         let mut editor_wait_started = None;
         let mut progress_missing_once = false;
+        let mut retry_started = None::<Instant>;
+        let mut retry_control_changed = false;
         loop {
             let observation = page
-                .evaluate_expression(UPLOAD_PAGE_SCRIPT.as_str())
+                .evaluate_expression(observation_script.as_str())
                 .await
                 .and_then(|result| result.into_value::<UploadObservation>().map_err(Into::into));
-            match observation.as_ref().ok().and_then(UploadObservation::progress) {
+            let observed_progress = observation
+                .as_ref()
+                .ok()
+                .and_then(UploadObservation::progress);
+            if matches!(
+                observed_progress,
+                Some(UploadProgress::Uploading { .. } | UploadProgress::Processing)
+            ) {
+                retry_started = None;
+            }
+            activity.observe(Instant::now(), observed_progress);
+            match observed_progress {
                 Some(value) => {
                     progress_missing_once = false;
                     progress.set(Some(value));
                 }
+                None if retry_started.is_some() => {}
                 None if progress_missing_once => progress.set(None),
                 // A single redraw or navigation can hide the upload widget briefly.
                 None => progress_missing_once = true,
@@ -312,23 +435,68 @@ async fn wait_for_uploaded_video(
                     }
                     match status {
                         UploadStatus::Ready => return Ok(()),
-                        UploadStatus::Failed => {
-                            return Err(UserError(
-                                "抖音页面提示上传失败，请检查视频格式、大小或网络。未执行最终提交。".into(),
-                            ).into());
+                        UploadStatus::Retryable if !retried => {
+                            // Resolve the exact control again. A redraw can replace it
+                            // between the read-only observation and file selection.
+                            let accepted =
+                                retry_video_upload(page, origin, asset)
+                                    .await
+                                    .map_err(|error| {
+                                        error.downcast::<UserError>().unwrap_or_else(|_| {
+                                            UserError(
+                                                "无法将原视频交给抖音重传。未执行最终提交。".into(),
+                                            )
+                                        })
+                                    })?;
+                            if accepted {
+                                retried = true;
+                                let now = Instant::now();
+                                retry_started = Some(now);
+                                activity = VideoUploadActivity::new(now, initial_wait);
+                                progress.set(Some(UploadProgress::Retrying));
+                            } else if retry_control_changed {
+                                return Err(upload_failure_error(
+                                    observation.failure,
+                                    activity.last_percent,
+                                    false,
+                                )
+                                .into());
+                            } else {
+                                retry_control_changed = true;
+                            }
+                        }
+                        UploadStatus::Retryable | UploadStatus::Failed => {
+                            let is_hard_failure = matches!(
+                                observation.failure,
+                                Some(UploadFailure::File | UploadFailure::Processing)
+                            );
+                            if is_hard_failure
+                                || !retry_started
+                                    .is_some_and(|since| since.elapsed() < RETRY_START_WAIT)
+                            {
+                                return Err(upload_failure_error(
+                                    observation.failure,
+                                    activity.last_percent,
+                                    retried,
+                                )
+                                .into());
+                            }
                         }
                         UploadStatus::NeedsLogin => {
                             return Err(UserError(
                                 "上传时抖音要求重新登录，请检查账号会话。未执行最终提交。".into(),
-                            ).into());
+                            )
+                            .into());
                         }
                         UploadStatus::EditorMissing => {
                             let since = editor_wait_started.get_or_insert_with(Instant::now);
                             if since.elapsed() >= Duration::from_secs(60) {
-                                return Err(status.timeout_error().into());
+                                return Err(status.timeout_error("", activity.last_percent).into());
                             }
                         }
-                        UploadStatus::Waiting | UploadStatus::Uploading | UploadStatus::Processing => {}
+                        UploadStatus::Waiting
+                        | UploadStatus::Uploading
+                        | UploadStatus::Processing => {}
                     }
                 }
                 Err(_) => {
@@ -336,15 +504,25 @@ async fn wait_for_uploaded_video(
                     if failures >= 4 {
                         return Err(UserError(
                             "上传时无法读取抖音页面，未能确认视频是否上传。未执行最终提交。".into(),
-                        ).into());
+                        )
+                        .into());
                     }
                 }
+            }
+            if Instant::now() >= activity.deadline && editor_wait_started.is_none() {
+                return Err(last_observed
+                    .timeout_error("等待抖音更新进度超时。", activity.last_percent)
+                    .into());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     })
     .await;
-    result.unwrap_or_else(|_| Err(last_observed.timeout_error().into()))
+    result.unwrap_or_else(|_| {
+        Err(last_observed
+            .timeout_error("已达到抖音视频上传最长等待时间。", activity.last_percent)
+            .into())
+    })
 }
 
 async fn creator_page(page: &Page) -> Result<CreatorPage> {
@@ -584,7 +762,16 @@ async fn wait_for_qr_sign_in(
                     qr_deadline = Instant::now() + Duration::from_secs(25);
                 }
                 Some(action) = sign_in.verification_action() => {
-                    let feedback = if phase == SignInStatus::VerifyInApp
+                    let feedback = if let VerificationAction::DouyinLoginSms(step) = action {
+                        if phase == SignInStatus::VerifyInApp
+                            && click_login_sms(page, CREATOR_ORIGIN, step).await
+                        {
+                            sign_in.set_douyin_login_sms(None);
+                            (step == DouyinLoginSms::SmsSent).then_some("正在等抖音确认短信验证结果。")
+                        } else {
+                            Some("抖音验证选项已变化，请查看当前页面后重试。")
+                        }
+                    } else if phase == SignInStatus::VerifyInApp
                         && let Some(viewport) = verification_viewport
                         && let Ok(state) = creator_page(page).await
                         && matches!(state.qr_status, Some(QrStatus::VerifyInApp))
@@ -598,6 +785,7 @@ async fn wait_for_qr_sign_in(
                         None
                     };
                     sign_in.set_input_feedback(feedback);
+                    ticker.reset_immediately();
                 }
                 _ = ticker.tick() => {
                     let state = match resolve_creator_page(page, &mut next_identity_check).await {
@@ -623,6 +811,9 @@ async fn wait_for_qr_sign_in(
                         };
                         sign_in.update(phase, None);
                         if phase == SignInStatus::VerifyInApp {
+                            sign_in.set_douyin_login_sms(
+                                login_sms_control(page, CREATOR_ORIGIN).await.map(|control| control.preview)
+                            );
                             if let Ok(viewport) = capture_verification(page, sign_in).await {
                                 verification_viewport = Some(viewport);
                             }
@@ -668,6 +859,32 @@ async fn wait_for_qr_sign_in(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct LoginSmsControl {
+    #[serde(flatten)]
+    preview: DouyinLoginSmsPreview,
+    point: [f64; 2],
+}
+
+async fn login_sms_control(page: &Page, expected_origin: &str) -> Option<LoginSmsControl> {
+    page.evaluate_expression(format!("({LOGIN_PHONE_SCRIPT})({expected_origin:?})"))
+        .await
+        .ok()
+        .and_then(|result| result.into_value::<Option<LoginSmsControl>>().ok())
+        .flatten()
+}
+
+async fn click_login_sms(page: &Page, expected_origin: &str, step: DouyinLoginSms) -> bool {
+    let Some(control) = login_sms_control(page, expected_origin)
+        .await
+        .filter(|control| control.preview.step == step)
+    else {
+        return false;
+    };
+    let [x, y] = control.point;
+    page.click(Point::new(x, y)).await.is_ok()
+}
+
 async fn capture_verification(page: &Page, sign_in: &SignInGuard) -> Result<(u32, u32)> {
     let (png, width, height) = read_verification_frame(page).await?;
     sign_in.update_verification(png, width, height);
@@ -701,13 +918,13 @@ async fn forward_verification_action(
         VerificationAction::Click { x, y }
             if (0.0..1.0).contains(&x) && (0.0..1.0).contains(&y) =>
         {
-            let _ = page
-                .click(Point {
-                    x: x * f64::from(width),
-                    y: y * f64::from(height),
-                })
-                .await;
-            None
+            page.click(Point {
+                x: x * f64::from(width),
+                y: y * f64::from(height),
+            })
+            .await
+            .err()
+            .map(|_| "暂时无法点击抖音验证页面，请等页面刷新后重试。")
         }
         VerificationAction::FillText(text) => Some(
             match fill_verification_field(page, expected_origin, text).await {
@@ -814,7 +1031,12 @@ impl PlatformAdapter for Douyin {
         }
     }
     fn prepare_timeout(&self, job: &Job) -> Duration {
-        upload_timeout(job.content.asset.size) + Duration::from_secs(8 * 60)
+        let limit = if job.content.asset.kind == MediaKind::Images {
+            initial_upload_timeout(job.content.asset.size)
+        } else {
+            VIDEO_UPLOAD_LIMIT
+        };
+        limit + Duration::from_secs(8 * 60)
     }
 
     async fn login(
@@ -917,14 +1139,18 @@ impl PlatformAdapter for Douyin {
                     .into());
                 }
             }
-            let limit = upload_timeout(content.asset.size);
-            ctx.stage(
-                JobState::Uploading,
-                &format!(
-                    "正在等待抖音上传和处理{media_label}，此素材最多等待 {} 分钟",
-                    limit.as_secs().div_ceil(60)
-                ),
-            )?;
+            let upload_message = if is_photo_post {
+                let minutes = initial_upload_timeout(content.asset.size)
+                    .as_secs()
+                    .div_ceil(60);
+                format!("正在等待抖音上传和处理图文，此素材最多等待 {minutes} 分钟")
+            } else {
+                format!(
+                    "正在等待抖音上传和处理视频。进度持续更新时，最多等待 {} 分钟",
+                    VIDEO_UPLOAD_LIMIT.as_secs() / 60
+                )
+            };
+            ctx.stage(JobState::Uploading, &upload_message)?;
             let progress = self.upload_progress.begin(&ctx.job.id);
             if is_photo_post {
                 content
@@ -937,7 +1163,14 @@ impl PlatformAdapter for Douyin {
                         UserError("无法把本地图片交给抖音，请检查图片和上传入口。".into())
                     })?;
                 let count = content.asset.images.len();
-                wait_for_uploaded_photos(&page, CREATOR_ORIGIN, count, limit, &progress).await?;
+                wait_for_uploaded_photos(
+                    &page,
+                    CREATOR_ORIGIN,
+                    count,
+                    initial_upload_timeout(content.asset.size),
+                    &progress,
+                )
+                .await?;
                 content
                     .asset
                     .verify()
@@ -971,19 +1204,19 @@ impl PlatformAdapter for Douyin {
                         "无法把本地视频交给抖音上传，请检查素材是否可访问及上传页状态。".into(),
                     )
                 })?;
-            wait_for_uploaded_video(&page, limit, &progress).await?;
+            wait_for_uploaded_video(
+                &page,
+                CREATOR_ORIGIN,
+                &content.asset,
+                VIDEO_UPLOAD_LIMIT,
+                &progress,
+            )
+            .await?;
             content
                 .asset
                 .verify()
                 .map_err(|e| UserError(e.to_string()))?;
-            let text = prepared_description(content);
-            fill_fields(&page, &content.title, &text)
-                .await
-                .map_err(|_| {
-                    UserError(
-                        "抖音已显示上传完成，但无法确认标题和描述已填写。未执行最终提交。".into(),
-                    )
-                })?;
+            prepare_video_text(&page, CREATOR_ORIGIN, content).await?;
             if !content.douyin_video_covers.is_empty() {
                 progress.set(Some(UploadProgress::SettingCover));
             }
@@ -1103,12 +1336,273 @@ mod tests {
     }
 
     #[test]
-    fn upload_timeout_accounts_for_large_files() {
-        let small = upload_timeout(5 * 1024 * 1024);
-        let large = upload_timeout(3 * 1024 * 1024 * 1024);
+    fn initial_upload_timeout_accounts_for_large_files() {
+        let small = initial_upload_timeout(5 * 1024 * 1024);
+        let large = initial_upload_timeout(3 * 1024 * 1024 * 1024);
         assert_eq!(small, Duration::from_secs(605));
         assert!(large > Duration::from_secs(900));
-        assert_eq!(upload_timeout(u64::MAX), Duration::from_secs(2 * 60 * 60));
+        assert_eq!(initial_upload_timeout(u64::MAX), VIDEO_UPLOAD_LIMIT);
+    }
+
+    #[test]
+    fn advancing_video_can_exceed_the_initial_window() {
+        let start = Instant::now();
+        let initial_wait = initial_upload_timeout(1_691_916_639);
+        let minute = |value: u64| start + Duration::from_secs(60 * value);
+        let uploading = |percent| Some(UploadProgress::Uploading { percent });
+        let mut activity = VideoUploadActivity::new(start, initial_wait);
+
+        activity.observe(minute(1), uploading(Some(0)));
+        assert_eq!(activity.deadline, start + initial_wait);
+        for (elapsed, percent) in [(5, 12), (12, 28), (20, 47), (28, 65), (36, 82), (43, 97)] {
+            assert!(minute(elapsed) < activity.deadline);
+            activity.observe(minute(elapsed), uploading(Some(percent)));
+        }
+        assert!(minute(43) > start + initial_wait);
+        assert_eq!(activity.deadline, minute(53));
+
+        activity.observe(minute(44), uploading(None));
+        activity.observe(minute(45), uploading(Some(96)));
+        activity.observe(minute(46), uploading(Some(97)));
+        assert_eq!(activity.deadline, minute(53));
+        assert_eq!(activity.last_percent, Some(97));
+
+        activity.observe(minute(47), uploading(Some(100)));
+        assert!(
+            UploadStatus::Uploading
+                .timeout_error("等待抖音更新进度超时。", activity.last_percent)
+                .to_string()
+                .contains("尚未确认上传完成")
+        );
+        activity.observe(minute(48), Some(UploadProgress::Processing));
+        activity.observe(minute(49), None);
+        activity.observe(minute(50), Some(UploadProgress::Processing));
+        assert_eq!(activity.deadline, minute(58));
+    }
+
+    #[tokio::test]
+    #[ignore = "需要本机 Chrome"]
+    async fn failed_video_upload_retries_once_without_publishing() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            }
+        });
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("原视频.mp4");
+        std::fs::write(&path, b"local upload fixture")?;
+        let asset = Asset::inspect(&path)?;
+        let mut browser = BrowserSession::launch(&temp.path().join("profile")).await?;
+        let page = browser
+            .browser
+            .new_page(format!("{origin}/creator-micro/content/post/video"))
+            .await?;
+        let fixture = r#"
+            <div class="upload-card-IBCFN_"><div class="progress-div">
+              <div class="upload-btn-PdfuUv progress-sub-ITjyPa">上传失败，重新上传
+                <input class="upload-btn-input-UY_qeY" type="file" accept="video/*" name="upload-btn" style="display:none">
+              </div>
+            </div></div>
+            <input placeholder="填写作品标题"><div class="zone-container" contenteditable="true">正文</div>
+            <button id="publish">发布</button>
+            <script>
+              window.retries = [];
+              window.publishes = 0;
+              document.querySelector('#publish').onclick = () => window.publishes++;
+              document.querySelector('.upload-btn-input-UY_qeY').onchange = (event) => {
+                window.retries.push(event.target.files[0].name);
+                if (document.body.dataset.failAgain) {
+                  event.target.value = '';
+                } else {
+                  event.target.closest('.progress-div').innerHTML = '<button>重新上传视频</button>';
+                }
+              };
+            </script>
+        "#;
+        let registry = UploadProgressRegistry::default();
+        let progress = registry.begin("upload-retry");
+        page.set_content(fixture).await?;
+        wait_for_uploaded_video(&page, &origin, &asset, Duration::from_secs(15), &progress).await?;
+        assert!(
+            truth(
+                &page,
+                "window.retries.join() === '原视频.mp4' && window.publishes === 0"
+            )
+            .await?
+        );
+
+        page.set_content(fixture).await?;
+        page.evaluate_expression("document.body.dataset.failAgain = 'yes'")
+            .await?;
+        let error =
+            wait_for_uploaded_video(&page, &origin, &asset, Duration::from_secs(15), &progress)
+                .await
+                .expect_err("the second upload must stop when the platform still reports failure");
+        assert!(error.to_string().contains("已自动重传一次"));
+        assert!(
+            truth(
+                &page,
+                "window.retries.join() === '原视频.mp4' && window.publishes === 0"
+            )
+            .await?
+        );
+        browser.close().await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "需要本机 Chrome"]
+    async fn login_phone_choice_activates_only_the_current_identity_option() -> Result<()> {
+        let profile = tempfile::tempdir()?;
+        let mut browser = BrowserSession::launch(profile.path()).await?;
+        let page = browser.browser.new_page("about:blank").await?;
+        page.set_content(
+            r#"
+            <button id="outside">手机验证码</button>
+            <div id="identity" style="position:fixed;left:24px;top:80px;background:white">
+              <h2>身份验证</h2>
+              <div id="phone"><span><b>手机</b><b>验证码</b></span><small>手机号尾号</small></div>
+              <button id="alternative">手机刷脸验证</button>
+            </div>
+            <script>
+              window.actions = [];
+              document.querySelector('#outside').onclick = () => actions.push('outside');
+              document.querySelector('#alternative').onclick = () => actions.push('alternative');
+              document.querySelector('#phone').onclick = (event) => {
+                if (!event.isTrusted) return;
+                actions.push('phone');
+                document.querySelector('#identity').innerHTML =
+                  '<h2>手机验证</h2><input placeholder="请输入验证码"><button>获取验证码</button>';
+              };
+            </script>
+            "#,
+        )
+        .await?;
+        let receive = DouyinLoginSms::ReceiveCode;
+        assert_eq!(
+            login_sms_control(&page, "null")
+                .await
+                .map(|control| control.preview.step),
+            Some(receive)
+        );
+        assert!(!click_login_sms(&page, "https://unrelated.invalid", receive).await);
+        assert!(truth(&page, "actions.length === 0").await?);
+
+        page.evaluate_expression(
+            "document.querySelector('#phone').setAttribute('aria-disabled', 'true')",
+        )
+        .await?;
+        assert!(!click_login_sms(&page, "null", receive).await);
+        page.evaluate_expression(
+            "document.querySelector('#phone').removeAttribute('aria-disabled')",
+        )
+        .await?;
+
+        let sign_ins = SignIns::default();
+        let sign_in = sign_ins.begin("test-account");
+        sign_in.update(SignInStatus::VerifyInApp, None);
+        let id = sign_ins.snapshot()["test-account"].verification_id.unwrap();
+        assert!(!sign_ins.send_verification_action(
+            "test-account",
+            id,
+            VerificationAction::DouyinLoginSms(receive)
+        ));
+        sign_in.set_douyin_login_sms(Some(DouyinLoginSmsPreview {
+            step: receive,
+            instructions: None,
+        }));
+        assert!(sign_ins.send_verification_action(
+            "test-account",
+            id,
+            VerificationAction::DouyinLoginSms(receive)
+        ));
+        assert!(matches!(
+            sign_in.verification_action().await,
+            Some(VerificationAction::DouyinLoginSms(
+                DouyinLoginSms::ReceiveCode
+            ))
+        ));
+        assert!(click_login_sms(&page, "null", receive).await);
+        assert!(!click_login_sms(&page, "null", receive).await);
+        assert!(
+            truth(
+                &page,
+                "actions.join() === 'phone' && !!document.querySelector('input')"
+            )
+            .await?
+        );
+
+        sign_in.update(SignInStatus::CheckingAccount, None);
+        assert!(!sign_ins.send_verification_action(
+            "test-account",
+            id,
+            VerificationAction::DouyinLoginSms(receive)
+        ));
+
+        page.set_content(
+            r#"
+            <div id="identity">
+              <div>身份验证</div>
+              <div>手机刷脸验证</div>
+              <div>抖音常用设备扫码</div>
+              <div onclick="openSms(event)"><span>发送短信验证</span></div>
+            </div>
+            <script>
+              window.actions = [];
+              window.openSms = (event) => {
+                if (!event.isTrusted) return;
+                window.actions.push('opened');
+                document.querySelector('#identity').innerHTML =
+                  '<div>发送短信验证</div><div>按说明发送短信</div>' +
+                  '<div><span>编辑短信内容：</span><strong>AB12</strong></div>' +
+                  '<div>发送至： <strong>1234567890</strong></div>' +
+                  '<div hidden>发送至：0000000000</div>' +
+                  '<button onclick="actions.push(event.isTrusted ? \'confirmed\' : \'invalid\')">我已发送</button>';
+              };
+            </script>
+            "#,
+        ).await?;
+        let send = DouyinLoginSms::SendSms;
+        let sent = DouyinLoginSms::SmsSent;
+        assert_eq!(
+            login_sms_control(&page, "null")
+                .await
+                .map(|control| control.preview.step),
+            Some(send)
+        );
+        assert!(!click_login_sms(&page, "null", receive).await);
+        assert!(!click_login_sms(&page, "null", sent).await);
+        assert!(click_login_sms(&page, "null", send).await);
+        let preview = login_sms_control(&page, "null").await.unwrap().preview;
+        assert_eq!(preview.step, sent);
+        let instructions = preview.instructions.unwrap();
+        assert_eq!(instructions.message, "AB12");
+        assert_eq!(instructions.recipient, "1234567890");
+        page.evaluate_expression(
+            "document.querySelector('#identity').insertAdjacentHTML('beforeend', '<div>发送至：2222222222</div>')",
+        )
+        .await?;
+        assert!(
+            login_sms_control(&page, "null")
+                .await
+                .unwrap()
+                .preview
+                .instructions
+                .is_none()
+        );
+        assert!(!click_login_sms(&page, "null", send).await);
+        assert!(truth(&page, "actions.join() === 'opened'").await?);
+        assert!(click_login_sms(&page, "null", sent).await);
+        assert!(truth(&page, "actions.join() === 'opened,confirmed'").await?);
+        browser.close().await?;
+        Ok(())
     }
 
     #[tokio::test]

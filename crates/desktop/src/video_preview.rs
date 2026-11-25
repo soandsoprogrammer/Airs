@@ -4,6 +4,7 @@ pub use macos::VideoPreview;
 #[cfg(target_os = "macos")]
 mod macos {
     use anyhow::{Context, Result, ensure};
+    use objc2::encode::{Encode, Encoding, RefEncode};
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::{Bool, ProtocolObject};
     use objc2::{
@@ -14,8 +15,8 @@ mod macos {
         NSWindowTabbingMode,
     };
     use objc2_foundation::{
-        MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-        NSString, NSURL,
+        MainThreadMarker, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
+        NSSize, NSString, NSURL,
     };
     use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path, ptr::NonNull};
 
@@ -24,6 +25,45 @@ mod macos {
 
     #[link(name = "AVKit", kind = "framework")]
     unsafe extern "C" {}
+
+    #[repr(C)]
+    struct MediaTime {
+        value: i64,
+        scale: i32,
+        flags: u32,
+        epoch: i64,
+    }
+
+    // SAFETY: This is Core Media's CMTime layout and Objective-C encoding.
+    unsafe impl Encode for MediaTime {
+        const ENCODING: Encoding = Encoding::Struct(
+            "?",
+            &[
+                Encoding::LongLong,
+                Encoding::Int,
+                Encoding::UInt,
+                Encoding::LongLong,
+            ],
+        );
+    }
+    // SAFETY: CMTime pointers have the encoding of a pointer to that struct.
+    unsafe impl RefEncode for MediaTime {
+        const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
+    }
+
+    #[repr(C)]
+    struct FrameImage {
+        _opaque: [u8; 0],
+    }
+    // SAFETY: CGImage is opaque and is passed only by pointer.
+    unsafe impl RefEncode for FrameImage {
+        const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("CGImage", &[]));
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageRelease(image: *mut FrameImage);
+    }
 
     extern_class!(
         // SAFETY: AVPlayer is declared as an NSObject subclass in AVPlayer.h.
@@ -179,6 +219,52 @@ mod macos {
             })
         }
 
+        pub fn thumbnail(path: &Path) -> Result<Vec<u8>> {
+            autoreleasepool(|_| {
+                let url = file_url(path)?;
+                // SAFETY: AVFoundation owns the generator and returns a retained CGImage.
+                // The bitmap representation retains the image before we release our reference.
+                unsafe {
+                    let asset: Retained<NSObject> =
+                        msg_send![class!(AVURLAsset), assetWithURL: &*url];
+                    let generator: Retained<NSObject> = msg_send![class!(AVAssetImageGenerator), assetImageGeneratorWithAsset: &*asset];
+                    let _: () =
+                        msg_send![&*generator, setAppliesPreferredTrackTransform: Bool::YES];
+                    let _: () = msg_send![&*generator, setMaximumSize: NSSize::new(720., 720.)];
+                    let frame = [500, 0]
+                        .into_iter()
+                        .find_map(|value| {
+                            let time = MediaTime {
+                                value,
+                                scale: 1000,
+                                flags: 1,
+                                epoch: 0,
+                            };
+                            let image: *mut FrameImage = msg_send![&*generator,
+                            copyCGImageAtTime: time,
+                            actualTime: std::ptr::null_mut::<MediaTime>(),
+                            error: std::ptr::null_mut::<*mut NSObject>()];
+                            NonNull::new(image)
+                        })
+                        .context("无法读取视频画面")?;
+
+                    let bitmap: *mut NSObject = msg_send![class!(NSBitmapImageRep), alloc];
+                    let bitmap: *mut NSObject = msg_send![bitmap, initWithCGImage: frame.as_ptr()];
+                    let bitmap = Retained::from_raw(bitmap);
+                    CGImageRelease(frame.as_ptr());
+                    let bitmap = bitmap.context("无法生成视频缩略图")?;
+                    let properties: Retained<NSObject> =
+                        msg_send![class!(NSDictionary), dictionary];
+                    let png: Option<Retained<NSData>> = msg_send![&*bitmap, representationUsingType: 4usize, properties: &*properties];
+                    let png = png.context("无法编码视频缩略图")?;
+                    let bytes: *const std::ffi::c_void = msg_send![&*png, bytes];
+                    let length: usize = msg_send![&*png, length];
+                    ensure!(!bytes.is_null() && length > 0, "视频缩略图为空");
+                    Ok(std::slice::from_raw_parts(bytes.cast::<u8>(), length).to_vec())
+                }
+            })
+        }
+
         /// Show a native player for a checked file. A new player starts paused.
         pub fn open(&mut self, path: &Path) -> Result<()> {
             let mtm = MainThreadMarker::new().context("无法在当前线程打开视频预览")?;
@@ -215,6 +301,10 @@ pub struct VideoPreview {
 
 #[cfg(not(target_os = "macos"))]
 impl VideoPreview {
+    pub fn thumbnail(_: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("当前系统无法生成视频缩略图")
+    }
+
     pub fn check(_: &std::path::Path) -> anyhow::Result<()> {
         anyhow::bail!("应用内视频预览目前支持 macOS")
     }

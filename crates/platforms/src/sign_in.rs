@@ -25,6 +25,7 @@ pub struct SignInPreview {
     pub verification: Option<VerificationFrame>,
     pub verification_id: Option<u64>,
     pub input_feedback: Option<&'static str>,
+    pub douyin_login_sms: Option<DouyinLoginSmsPreview>,
     pub publish_sms: Option<PublishSmsPreview>,
     pub wechat_channels: Option<WechatChannelsPreview>,
 }
@@ -40,6 +41,7 @@ impl SignInPreview {
             self.verification = None;
             self.verification_id = None;
             self.input_feedback = None;
+            self.douyin_login_sms = None;
             self.publish_sms = None;
             self.wechat_channels = None;
         }
@@ -54,9 +56,14 @@ impl SignInPreview {
                 VerificationAction::VerifySmsCode(_) => {
                     self.publish_sms.is_some_and(|sms| sms.can_verify)
                 }
-                VerificationAction::Click { .. } | VerificationAction::FillText(_) => {
-                    self.verification.is_some()
+                VerificationAction::Click { .. } => self.verification.is_some(),
+                VerificationAction::FillText(_) => {
+                    self.verification.is_some() && self.douyin_login_sms.is_none()
                 }
+                VerificationAction::DouyinLoginSms(step) => self
+                    .douyin_login_sms
+                    .as_ref()
+                    .is_some_and(|sms| sms.step == *step),
                 VerificationAction::WechatQuickLogin => matches!(
                     self.wechat_channels,
                     Some(WechatChannelsPreview::Choice { .. })
@@ -85,6 +92,27 @@ pub struct VerificationFrame {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DouyinLoginSms {
+    ReceiveCode,
+    SendSms,
+    SmsSent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct DouyinLoginSmsPreview {
+    #[serde(rename = "kind")]
+    pub step: DouyinLoginSms,
+    pub instructions: Option<DouyinSmsInstructions>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct DouyinSmsInstructions {
+    pub message: String,
+    pub recipient: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct PublishSmsPreview {
     pub can_request_code: bool,
     pub can_verify: bool,
@@ -108,6 +136,7 @@ pub struct WechatChannelChoice {
 pub enum VerificationAction {
     Click { x: f64, y: f64 },
     FillText(String),
+    DouyinLoginSms(DouyinLoginSms),
     RequestSmsCode,
     VerifySmsCode(String),
     WechatQuickLogin,
@@ -228,6 +257,13 @@ impl SignInGuard {
                 width,
                 height,
             });
+        }
+    }
+
+    pub(crate) fn set_douyin_login_sms(&self, sms: Option<DouyinLoginSmsPreview>) {
+        let mut preview = self.entry.preview.lock().unwrap();
+        if preview.status == SignInStatus::VerifyInApp {
+            preview.douyin_login_sms = sms;
         }
     }
 

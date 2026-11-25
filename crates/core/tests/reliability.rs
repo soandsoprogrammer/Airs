@@ -689,3 +689,24 @@ fn removal_reports_if_only_local_profile_cleanup_fails() {
     std::fs::remove_file(profile).unwrap();
     s.remove_account(&a.id).unwrap();
 }
+
+#[test]
+fn recent_tags_follow_drafts_and_successful_batches_across_restarts() {
+    let (dir, store, account, mut content) = setup();
+    content.tags = vec!["GTA".into(), "游戏设计".into()];
+    store.save_draft("composer", &content).unwrap();
+    content.tags = vec!["gta".into(), "像素动画".into()];
+    store.enqueue("tag-history", &[account], &content).unwrap();
+
+    content.tags = vec!["未使用".into()];
+    assert!(store.enqueue("no-account", &[], &content).is_err());
+    let reopened = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.recent_tags().unwrap(),
+        ["gta", "像素动画", "游戏设计"]
+    );
+    assert_eq!(
+        reopened.draft("composer").unwrap().unwrap().tags,
+        ["GTA", "游戏设计"]
+    );
+}

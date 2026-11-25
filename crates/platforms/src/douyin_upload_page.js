@@ -1,5 +1,6 @@
-(creatorOrigin) => {
-  const observation = (status, percent = null) => ({ status, percent });
+(creatorOrigin, retryInputOnly = false) => {
+  const observation = (status, percent = null, failure = null) => retryInputOnly
+    ? null : { status, percent, ...(failure ? { failure } : {}) };
   if (location.origin !== creatorOrigin || !document.body) return observation('waiting');
 
   const path = location.pathname.replace(/\/$/, '');
@@ -8,7 +9,7 @@
   const uploadPage = path === '/creator-micro/content/upload';
   const visible = (element) => !!element && element.getClientRects().length > 0 &&
     getComputedStyle(element).visibility === 'visible' &&
-    !element.closest('[hidden], [aria-hidden="true"]') &&
+    !element.closest('[hidden], [aria-hidden="true"], [inert]') &&
     (element.checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) ?? true);
 
   // Read text from visible nodes so a hidden status inside a visible card cannot
@@ -25,8 +26,8 @@
     }
     return parts;
   };
-  const hasMessage = (roots, pattern) => roots.some((root) =>
-    textParts(root).some((part) => part.split(/\n/).some((line) => pattern.test(line.trim()))));
+  const hasMessage = (roots, pattern, ignored) => roots.some((root) =>
+    textParts(root, ignored).some((part) => part.split(/\n/).some((line) => pattern.test(line.trim()))));
 
   const dialogs = [...document.querySelectorAll('dialog, [role="dialog"], [aria-modal="true"]')]
     .filter(visible);
@@ -45,9 +46,60 @@
   const alerts = [...document.querySelectorAll('[role="alert"], [aria-live="assertive"]')]
     .filter(visible);
   const statusRoots = [...widgets, ...alerts];
+  const disabledSelector = ':disabled, [disabled], [aria-disabled="true"]';
+  const ignoredStatus = '.progress-p, [class*="progress-p-"], .dy-creator-content-modal, .semi-modal';
+  const uploadFailure = /^(?:视频)?上传失败(?:$|[\s，,:：。！!])/;
 
-  if (hasMessage(statusRoots, /^(?:视频)?上传失败(?:$|[\s，,:：。！!])/)) return observation('failed');
-  if (hasMessage(statusRoots, /^(?:视频)?(?:正在处理|处理中|正在转码|转码中)/)) {
+  // The failed video card contains a regular replacement file input. Its
+  // wrapper is visible, but the platform hides the input with CSS.
+  const retryControls = composer ? [...document.querySelectorAll(
+    '.upload-card-IBCFN_ .progress-div > div.upload-btn-PdfuUv.progress-sub-ITjyPa',
+  )].filter((control) => visible(control) &&
+    textParts(control, ignoredStatus).join('').replace(/\s+/g, '') === '上传失败，重新上传') : [];
+  const lines = (roots) => roots.flatMap((root) => textParts(root, ignoredStatus)
+    .flatMap((text) => text.split(/\n/).map((line) => line.trim())));
+  const failureText = [...lines(widgets), ...lines(alerts).filter((line) =>
+    retryControls.length || /^(?:视频|文件|上传失败|不支持(?:该|此)?视频格式)/.test(line))];
+  const hasFailure = (pattern) => failureText.some((line) =>
+    pattern.test(line.replace(/^(?:视频)?上传失败[\s，,:：。！!]+/, '')));
+  const fileFailure = hasFailure(
+    /^(?:(?:视频(?:的)?(?:文件|格式|编码|分辨率|时长|大小|码率)|文件(?:格式|大小)).{0,40}(?:不支持|不受支持|不符合|不正确|不合法|超出|超过|过大|过小|过高|过低|限制)|不支持(?:该|此)?视频格式|请上传(?:符合要求|支持格式)的?视频)/
+  );
+  const processingFailure = hasFailure(
+    /^(?:视频(?:文件)?)?(?:解码|转码|解析|处理)(?:视频|文件)?(?:失败|异常)(?:$|[\s，,:：。！!])/
+  );
+  const networkFailure = hasFailure(
+    /^(?:网络(?:异常|错误|连接失败|连接超时|不稳定|已断开)|连接超时|请求超时)(?:$|[\s，,:：。！!])/
+  );
+  const serviceFailure = hasFailure(
+    /^(?:服务器(?:繁忙|异常|错误)|服务(?:器)?暂不可用|系统(?:繁忙|异常))(?:$|[\s，,:：。！!])/
+  );
+  const failure = fileFailure ? 'file' : processingFailure ? 'processing'
+    : networkFailure ? 'network' : serviceFailure ? 'service' : null;
+
+  if (retryControls.length === 1 && !fileFailure && !processingFailure && !dialogs.length) {
+    const control = retryControls[0];
+    const input = control.querySelectorAll(
+      ':scope > input[type="file"].upload-btn-input-UY_qeY[name="upload-btn"]',
+    );
+    if (input.length === 1 && !control.closest(`${disabledSelector}, [aria-busy="true"]`) &&
+        getComputedStyle(control).pointerEvents !== 'none' &&
+        !input[0].matches(`${disabledSelector}, [multiple], [directory], [webkitdirectory]`) &&
+        !input[0].files?.length &&
+        input[0].accept.split(',').some((item) => /^video\/(?:\*|[\w.+-]+)$/i.test(item.trim()))) {
+      return retryInputOnly ? input[0] : observation('retryable', null, failure);
+    }
+  }
+  if (retryInputOnly) return null;
+  const alertFailure = /^视频上传失败(?:$|[\s，,:：。！!])|^上传失败(?:[。！!])?$|^上传失败[，,:：]\s*(?:请(?:稍后)?重试|请重新上传|网络|服务器|系统)/;
+  if (retryControls.length || failure || hasMessage(widgets, uploadFailure, ignoredStatus) ||
+      hasMessage(alerts, alertFailure, ignoredStatus)) return observation('failed', null, failure);
+
+  const decoding = composer && hasMessage(
+    [...document.querySelectorAll('.upload-card-IBCFN_ .encoding-jbSjaQ .loading-M_XtMr')],
+    /^视频解码中(?:\.{3}|…)?$/,
+  );
+  if (decoding || hasMessage(statusRoots, /^(?:视频)?(?:正在处理|处理中|正在转码|转码中)/)) {
     return observation('processing');
   }
 
@@ -114,7 +166,6 @@
   const widgetControls = widgets.flatMap((widget) =>
     [widget, ...widget.querySelectorAll('div, span, button, [role="button"]')]);
   const buttonSelector = 'button, [role="button"]';
-  const disabledSelector = ':disabled, [disabled], [aria-disabled="true"]';
   const composerButtons = composer ? [...document.querySelectorAll(buttonSelector)] : [];
   const reupload = [...widgetControls, ...composerButtons].some((control) => {
     if (!visible(control) || control.closest(`aside, [role="note"], ${disabledSelector}`)) return false;
