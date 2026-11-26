@@ -13,5 +13,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 chromiumoxide = "=0.9.1"
 futures = "0.3"
+uuid.workspace = true
 [dev-dependencies]
 tempfile = "3"

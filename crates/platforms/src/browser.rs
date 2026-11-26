@@ -1,11 +1,17 @@
 use anyhow::{Result, ensure};
-use chromiumoxide::{Browser, BrowserConfig, Page, handler::viewport::Viewport};
+use chromiumoxide::{Browser as ChromeBrowser, BrowserConfig, handler::viewport::Viewport};
+mod page;
 use futures::StreamExt;
+pub use page::Page;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::task::JoinHandle;
+
+pub fn uses_system_webkit() -> bool {
+    cfg!(target_os = "macos")
+}
 
 pub fn chrome_path() -> PathBuf {
     std::env::var_os("PUBLISHER_CHROME")
@@ -54,12 +60,70 @@ fn default_chrome_path() -> PathBuf {
     .unwrap_or_else(|| PathBuf::from(r"C:\Program Files").join(INSTALL_PATH))
 }
 
+pub enum Browser {
+    Chrome(Box<ChromeBrowser>),
+    #[cfg(target_os = "macos")]
+    WebKit {
+        profile: uuid::Uuid,
+        sessions: tokio::sync::Mutex<Vec<std::sync::Arc<crate::webkit::Session>>>,
+    },
+}
+
+impl Browser {
+    pub async fn new_page(&self, url: impl AsRef<str>) -> Result<Page> {
+        match self {
+            Self::Chrome(browser) => Ok(Page::Chrome(browser.new_page(url.as_ref()).await?)),
+            #[cfg(target_os = "macos")]
+            Self::WebKit { profile, sessions } => {
+                let session =
+                    std::sync::Arc::new(crate::webkit::Session::launch(*profile, true).await?);
+                session.navigate(url.as_ref()).await?;
+                sessions.lock().await.push(session.clone());
+                Ok(Page::WebKit {
+                    session,
+                    target: serde_json::from_value(serde_json::json!(
+                        uuid::Uuid::new_v4().to_string()
+                    ))?,
+                })
+            }
+        }
+    }
+}
+
 pub struct BrowserSession {
     pub browser: Browser,
-    handler: JoinHandle<()>,
+    handler: Option<JoinHandle<()>>,
 }
 impl BrowserSession {
     pub async fn launch(profile: &Path) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if uses_system_webkit() {
+            let profile_id = match profile
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| uuid::Uuid::parse_str(name).ok())
+            {
+                Some(id) => id,
+                None => {
+                    std::fs::create_dir_all(profile)?;
+                    let id_path = profile.join("webkit-profile-id");
+                    if id_path.is_file() {
+                        uuid::Uuid::parse_str(std::fs::read_to_string(id_path)?.trim())?
+                    } else {
+                        let id = uuid::Uuid::new_v4();
+                        std::fs::write(id_path, id.to_string())?;
+                        id
+                    }
+                }
+            };
+            return Ok(Self {
+                browser: Browser::WebKit {
+                    profile: profile_id,
+                    sessions: Default::default(),
+                },
+                handler: None,
+            });
+        }
         let path = profile
             .parent()
             .and_then(|p| p.parent())
@@ -80,7 +144,7 @@ impl BrowserSession {
             .request_timeout(Duration::from_secs(30))
             .arg("--no-first-run")
             .arg("--no-default-browser-check");
-        let (browser, mut handler) = Browser::launch(
+        let (browser, mut handler) = ChromeBrowser::launch(
             config
                 .build()
                 .map_err(|_| anyhow::anyhow!("浏览器配置无效"))?,
@@ -93,29 +157,56 @@ impl BrowserSession {
                 }
             }
         });
-        Ok(Self { browser, handler })
+        Ok(Self {
+            browser: Browser::Chrome(Box::new(browser)),
+            handler: Some(handler),
+        })
     }
     pub async fn close(&mut self) -> Result<()> {
-        let _ = tokio::time::timeout(Duration::from_secs(4), self.browser.close()).await;
-        if tokio::time::timeout(Duration::from_secs(4), self.browser.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.browser.kill().await;
+        match &mut self.browser {
+            Browser::Chrome(browser) => {
+                let _ = tokio::time::timeout(Duration::from_secs(4), browser.close()).await;
+                if tokio::time::timeout(Duration::from_secs(4), browser.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = browser.kill().await;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Browser::WebKit { sessions, .. } => {
+                for session in sessions.get_mut().drain(..) {
+                    session.close().await?;
+                }
+            }
         }
-        self.handler.abort();
+        if let Some(handler) = self.handler.take() {
+            handler.abort();
+        }
         Ok(())
     }
 }
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        self.handler.abort();
+        if let Some(handler) = self.handler.take() {
+            handler.abort();
+        }
     }
 }
 pub async fn truth(page: &Page, script: &str) -> Result<bool> {
     Ok(page.evaluate(script).await?.into_value::<bool>()?)
 }
 pub async fn upload_file(page: &Page, selector: &str, path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(session) = page.webkit() {
+        let selector = serde_json::to_string(selector)?;
+        return session
+            .choose_files(
+                &format!("document.querySelector({selector})"),
+                &[path.to_owned()],
+            )
+            .await;
+    }
     use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
     let el = page.find_element(selector).await?;
     page.execute(

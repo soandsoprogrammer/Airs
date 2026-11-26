@@ -1,5 +1,5 @@
-use chromiumoxide::Page;
 use publisher_platforms::browser::BrowserSession;
+use publisher_platforms::browser::Page;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -17,7 +17,7 @@ async fn creator_state(page: &Page, origin: &str) -> anyhow::Result<Value> {
 }
 
 #[tokio::test]
-#[ignore = "需要本机 Chrome；使用 --ignored 显式运行"]
+#[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）；使用 --ignored 显式运行"]
 async fn creator_page_distinguishes_session_from_interaction_required() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let origin = format!("http://{}", listener.local_addr()?);

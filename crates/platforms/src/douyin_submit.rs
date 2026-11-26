@@ -1,7 +1,8 @@
+use crate::browser::Page;
 use crate::douyin::{PHOTO_FILE_SELECTOR, PHOTO_PAGE_SCRIPT, PhotoSnapshot};
 use crate::douyin_video_topics::VIDEO_TEXT_CHECK;
 use anyhow::Result;
-use chromiumoxide::{Page, layout::Point};
+use chromiumoxide::layout::Point;
 use publisher_core::{Content, MediaKind, UserError};
 
 const CREATOR_ORIGIN: &str = "https://creator.douyin.com";
@@ -220,7 +221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn publish_click_requires_matching_content_and_one_uncovered_button() -> Result<()> {
         let (origin, server) = fixture_server().await?;
         let profile = tempfile::tempdir()?;
@@ -373,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn publish_scroll_keeps_button_clear_of_fixed_sidebar() -> Result<()> {
         let (origin, server) = fixture_server().await?;
         let profile = tempfile::tempdir()?;
@@ -429,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn photo_upload_and_publish_keep_order_and_require_completed_images() -> Result<()> {
         let (origin, server) = fixture_server().await?;
         let profile = tempfile::tempdir()?;

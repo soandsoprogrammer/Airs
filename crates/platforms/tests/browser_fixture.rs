@@ -1,6 +1,6 @@
 use publisher_platforms::browser::*;
 #[tokio::test]
-#[ignore = "需要本机 Chrome；使用 --ignored 显式运行"]
+#[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）；使用 --ignored 显式运行"]
 async fn cdp_upload_fill_dialog_and_cleanup_without_submission() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let profile = tmp.path().join("profile");
@@ -11,10 +11,8 @@ async fn cdp_upload_fill_dialog_and_cleanup_without_submission() -> anyhow::Resu
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/upload.html")
         .canonicalize()?;
-    let page = session
-        .browser
-        .new_page(format!("file://{}", fixture.display()))
-        .await?;
+    let page = session.browser.new_page("about:blank").await?;
+    page.set_content(std::fs::read_to_string(fixture)?).await?;
     assert!(
         truth(&page, "innerWidth >= 1280 && innerHeight >= 720").await?,
         "creator pages need room for their desktop editor and fixed navigation"
@@ -54,7 +52,7 @@ async fn cdp_upload_fill_dialog_and_cleanup_without_submission() -> anyhow::Resu
 }
 
 #[tokio::test]
-#[ignore = "需要本机 Chrome；使用 --ignored 显式运行"]
+#[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）；使用 --ignored 显式运行"]
 async fn profiles_preserve_session_and_isolate_same_site_accounts() -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

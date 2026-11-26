@@ -1,8 +1,8 @@
 use super::{CREATOR_ORIGIN, editor::Expected};
+use crate::browser::Page;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::{
-    Page,
     cdp::browser_protocol::{
         network::{
             ConfigureDurableMessagesParams, EnableParams, EventLoadingFinished,
@@ -24,7 +24,7 @@ const PUBLISH_URL: &str = "https://edith.xiaohongshu.com/web_api/sns/v2/note";
 const MAX_MESSAGE_BYTES: usize = 128 * 1024;
 const NETWORK_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
 
-pub(super) struct Observer {
+struct ChromeObserver {
     target_id: TargetId,
     frame_id: FrameId,
     loader_id: LoaderId,
@@ -33,12 +33,67 @@ pub(super) struct Observer {
     finishes: EventStream<EventLoadingFinished>,
 }
 
+pub(super) struct Observer {
+    transport: Transport,
+}
+enum Transport {
+    Chrome(ChromeObserver),
+    #[cfg(target_os = "macos")]
+    WebKit(TargetId),
+}
+impl Observer {
+    pub(super) async fn start(page: &Page) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if let Some(session) = page.webkit() {
+            let url: String = session.evaluate("location.href").await?;
+            ensure!(is_composer(&url), "小红书发布页已变化");
+            session.arm_receipts(&[PUBLISH_URL.into()]).await?;
+            return Ok(Self {
+                transport: Transport::WebKit(page.target_id().clone()),
+            });
+        }
+        Ok(Self {
+            transport: Transport::Chrome(ChromeObserver::start(page).await?),
+        })
+    }
+    pub(super) async fn wait_for(
+        self,
+        page: &Page,
+        expected: &Expected,
+        limit: Duration,
+    ) -> Result<Option<Receipt>> {
+        match self.transport {
+            Transport::Chrome(observer) => observer.wait_for(page, expected, limit).await,
+            #[cfg(target_os = "macos")]
+            Transport::WebKit(target) => {
+                ensure!(&target == page.target_id(), "小红书回执页面已变化");
+                let session = page
+                    .webkit()
+                    .ok_or_else(|| anyhow::anyhow!("WebKit 会话不可用"))?;
+                crate::webkit::wait_response(session, limit, |response| {
+                    if !is_composer(&response.document)
+                        || !is_publish(&response.endpoint)
+                        || !matches_work(response.request.as_deref()?, expected)
+                    {
+                        return None;
+                    }
+                    parse_receipt(GetResponseBodyReturns {
+                        body: response.body,
+                        base64_encoded: false,
+                    })
+                })
+                .await
+            }
+        }
+    }
+}
+
 struct Pending {
     id: RequestId,
     accepted_transport: bool,
 }
 
-impl Observer {
+impl ChromeObserver {
     pub(super) async fn start(page: &Page) -> Result<Self> {
         let frame = page
             .execute(GetFrameTreeParams {})

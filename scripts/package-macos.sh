@@ -26,6 +26,9 @@ cp -X "$icon_tmp/AirsIcon.icns" "$bundle/Contents/Resources/AirsIcon.icns"
 # Replace through a temporary path so a running development app is not overwritten in place.
 cp -X "target/$mode/social-publisher" "$bundle/Contents/MacOS/social-publisher.new"
 mv "$bundle/Contents/MacOS/social-publisher.new" "$bundle/Contents/MacOS/social-publisher"
+helper_path=$("target/$mode/social-publisher" --print-webkit-host-path)
+cp -X "$helper_path" "$bundle/Contents/MacOS/airs-webkit-host"
+codesign --force --sign - "$bundle/Contents/MacOS/airs-webkit-host"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

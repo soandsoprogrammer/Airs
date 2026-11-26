@@ -259,7 +259,7 @@ impl Worker {
             "准备任务已建立，将停在最终提交前"
         })
     }
-    fn handle(&self, cmd: Command) -> anyhow::Result<String> {
+    async fn handle(&self, cmd: Command) -> anyhow::Result<String> {
         match cmd {
             Command::AddAccount(p) => {
                 anyhow::ensure!(ACCOUNT_PLATFORMS.contains(&p), "平台尚未接入");
@@ -295,6 +295,8 @@ impl Worker {
                     "请先停止该账号的登录检查"
                 );
                 self.store.remove_account(&id)?;
+                #[cfg(target_os = "macos")]
+                publisher_platforms::webkit::remove_account_profile(&id).await?;
                 Ok("账号和本地登录资料已删除，历史任务可在任务记录中查看".into())
             }
             Command::Login(id) => {
@@ -548,7 +550,7 @@ impl Backend {
                         worker.shutdown().await;
                         break;
                     }
-                    let message = worker.handle(cmd).unwrap_or_else(|e| e.to_string());
+                    let message = worker.handle(cmd).await.unwrap_or_else(|e| e.to_string());
                     if !message.is_empty() {
                         let _ = worker.updates.send(Update::Message(message));
                         let _ = worker.refresh();

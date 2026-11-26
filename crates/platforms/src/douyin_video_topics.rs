@@ -1,6 +1,7 @@
+use crate::browser::Page;
 use crate::browser::{fill_fields, truth};
 use anyhow::{Result, ensure};
-use chromiumoxide::{Page, cdp::browser_protocol::input::InsertTextParams, layout::Point};
+use chromiumoxide::{cdp::browser_protocol::input::InsertTextParams, layout::Point};
 use publisher_core::{Content, UserError};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};

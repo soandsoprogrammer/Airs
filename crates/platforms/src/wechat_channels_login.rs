@@ -1,10 +1,10 @@
 use super::{CREATOR_ORIGIN, HOME_URL};
+use crate::browser::Page;
 use crate::sign_in::{
     SignInGuard, SignInStatus, VerificationAction, WechatChannelChoice, WechatChannelsPreview,
 };
 use anyhow::{Result, ensure};
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::{
             dom::DescribeNodeParams,
@@ -131,6 +131,19 @@ async fn frame_state(
 ) -> Result<State> {
     let x = bounds.x + bounds.width / 2.;
     let y = bounds.y + bounds.height / 2.;
+    #[cfg(target_os = "macos")]
+    if let Some(session) = page.webkit() {
+        let [scroll_x, scroll_y]: [f64; 2] = session.evaluate("[scrollX,scrollY]").await?;
+        return Ok(session
+            .evaluate_frame_at(
+                x - scroll_x,
+                y - scroll_y,
+                oauth_origin,
+                &expression(origin, oauth_origin, true),
+            )
+            .await
+            .unwrap_or(State::Pending));
+    }
     let mut request = EvaluateParams::new(format!(
         "document.elementFromPoint({x} - scrollX, {y} - scrollY)"
     ));
@@ -502,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn offers_desktop_login_and_qr_then_checks_the_selected_account() -> Result<()> {
         let (oauth, frame_server) = serve(
             r#"<div class="js_quick_login web_qrcode_panel_quick_login">

@@ -1,7 +1,7 @@
+use crate::browser::Page;
 use crate::upload_progress::{UploadProgress, UploadProgressGuard, UploadProgressRegistry};
 use anyhow::Result;
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::{
             dom::{DescribeNodeParams, SetFileInputFilesParams},
@@ -144,6 +144,35 @@ async fn select_video(
         .await?
         .node
         .backend_node_id;
+    #[cfg(target_os = "macos")]
+    if let Some(session) = page.webkit() {
+        let node = serde_json::to_string(&input)?;
+        let point = page
+            .evaluate_expression(expression(origin, "uploadButtonPoint", "")?)
+            .await?
+            .into_value::<Option<[f64; 2]>>()?
+            .ok_or_else(|| UserError("快手的上传视频按钮暂时不可操作。".into()))?;
+        let path = std::path::PathBuf::from(path);
+        let element = format!("globalThis.__airsDomRefs?.get({node})");
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(UserError("已取消快手视频准备。".into()).into()),
+            result = session.choose_files_at(&element, std::slice::from_ref(&path), Some(point)) => result,
+        };
+        if result.is_err()
+            && let Ok(observation) = observe(page, origin, "observe", "").await
+            && let Some(reason) = observation.rejection
+        {
+            return Err(UserError(format!("快手：{reason}")).into());
+        }
+        if result
+            .as_ref()
+            .is_err_and(|e| e.to_string() == "文件选择入口不匹配")
+        {
+            return Err(UserError("快手打开了与视频上传入口不匹配的文件选择窗口。".into()).into());
+        }
+        return result;
+    }
     let mut chooser = page.event_listener::<EventFileChooserOpened>().await?;
     let handoff = async {
         page.execute(SetInterceptFileChooserDialogParams::new(true))
@@ -348,7 +377,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome；使用 --ignored 显式运行"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）；使用 --ignored 显式运行"]
     async fn selects_local_video_and_prepares_caption_without_publishing() -> Result<()> {
         const HTML: &str = r#"<!doctype html><meta charset="utf-8">
             <div id="root-video-publish"><div id="onvideo_creator_platform">

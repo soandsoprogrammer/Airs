@@ -817,7 +817,7 @@ impl Publisher {
                         Platform::Kuaishou => "选择快手登录角色",
                         Platform::Xiaohongshu => "小红书短信登录",
                         Platform::WechatChannels => "完成视频号登录验证",
-                        _ => "完成抖音安全验证",
+                        _ => "抖音登录与安全验证",
                     }),
             )
             .when_some(sms_instructions, |panel, sms| {
@@ -1697,7 +1697,7 @@ impl Publisher {
                                 if platform == Some(Platform::Xiaohongshu) {
                                     "手机号或短信验证码"
                                 } else {
-                                    "验证码或网页要求的文字"
+                                    "手机号、验证码或网页要求的文字"
                                 },
                             )
                         });
@@ -2365,18 +2365,27 @@ impl Publisher {
                     .child(setting_title(
                         AppIcon::PanelTop,
                         "后台浏览器",
-                        "使用 Google Chrome 在后台处理，登录入口在应用内。".into(),
+                        if publisher_platforms::browser::uses_system_webkit() {
+                            "使用 macOS 系统 WebKit，登录入口在应用内，无需安装 Chrome。".into()
+                        } else {
+                            "使用 Google Chrome 在后台处理，登录入口在应用内。".into()
+                        },
                     ))
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child("Chrome 程序路径"),
+                    .when(
+                        !publisher_platforms::browser::uses_system_webkit(),
+                        |panel| {
+                            panel.child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("Chrome 程序路径"),
+                                    )
+                                    .child(browser_field),
                             )
-                            .child(browser_field),
+                        },
                     );
                 let queue_panel = surface()
                     .when(wide, |panel| panel.w(px(270.)).flex_shrink_0())
@@ -2610,6 +2619,11 @@ impl Render for Publisher {
     }
 }
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    if std::env::args().any(|a| a == "--print-webkit-host-path") {
+        println!("{}", publisher_platforms::webkit::host_path()?.display());
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--browser-smoke") {
         return browser_smoke();
     }
@@ -2620,6 +2634,16 @@ fn main() -> anyhow::Result<()> {
     let store = Store::open(root)?;
     let _instance = store.lease("application")?;
     store.recover()?;
+    #[cfg(target_os = "macos")]
+    {
+        let marker = store.root.join("webkit-session-migration-v1");
+        if !marker.exists() {
+            for account in store.accounts()? {
+                store.sync_session(&account.id, publisher_core::SessionStatus::NeedsLogin, None)?;
+            }
+            std::fs::write(marker, "1")?;
+        }
+    }
     let backend = Backend::new(store);
     let shutdown = backend.tx.clone();
     let exit = backend.tx.clone();
@@ -2682,14 +2706,23 @@ fn browser_smoke() -> anyhow::Result<()> {
         std::fs::create_dir_all(&path)?;
         let mut session = publisher_platforms::browser::BrowserSession::launch(&path).await?;
         let page = session.browser.new_page("about:blank").await?;
-        page.evaluate("document.title='Rust CDP 正常'; 1+1").await?;
+        page.evaluate("document.title='Airs 浏览器正常'; 1+1")
+            .await?;
         anyhow::ensure!(
-            page.get_title().await? == Some("Rust CDP 正常".into()),
-            "CDP 验证失败"
+            page.evaluate("document.title")
+                .await?
+                .into_value::<String>()?
+                == "Airs 浏览器正常",
+            "浏览器验证失败"
         );
         session.close().await?;
+        #[cfg(target_os = "macos")]
+        publisher_platforms::webkit::remove_account_profile(
+            std::fs::read_to_string(path.join("webkit-profile-id"))?.trim(),
+        )
+        .await?;
         std::fs::remove_dir_all(path)?;
-        println!("Chrome 启动、CDP 事件处理和退出验证通过");
+        println!("后台浏览器启动、页面操作和退出验证通过");
         Ok(())
     })
 }

@@ -191,7 +191,7 @@
   if (captionValue !== expectedCaption || (short && short.value !== shortTitle)) {
     return result('contentChanged');
   }
-  const descriptionText = description.innerText.replace(/\r\n?/g, '\n');
+  const descriptionText = normalize(description.innerText);
   if (snapshot && (media !== snapshot.media || descriptionText !== snapshot.description ||
       (short?.value ?? null) !== snapshot.shortTitle)) {
     return result('mediaChanged');

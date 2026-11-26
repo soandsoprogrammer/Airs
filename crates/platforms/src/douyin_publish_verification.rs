@@ -1,6 +1,7 @@
+use crate::browser::Page;
 use crate::douyin::read_verification_frame;
 use crate::sign_in::{PublishSmsPreview, SignInGuard, SignInStatus, SignIns, VerificationAction};
-use chromiumoxide::{Page, cdp::js_protocol::runtime::EvaluateParams};
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{future::pending, time::Duration};
@@ -286,7 +287,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn publish_sms_actions_are_manual_and_cannot_reach_the_main_publish_button()
     -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

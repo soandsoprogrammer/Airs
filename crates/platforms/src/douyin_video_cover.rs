@@ -1,6 +1,6 @@
+use crate::browser::Page;
 use anyhow::Result;
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::dom::{DescribeNodeParams, SetFileInputFilesParams},
         js_protocol::runtime::EvaluateParams,
@@ -396,7 +396,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn both_cover_orientations_use_the_actual_upload_and_recheck_saved_preview() -> Result<()>
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

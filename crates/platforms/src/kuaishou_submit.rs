@@ -1,6 +1,7 @@
+use crate::browser::Page;
 use crate::kuaishou::photo::PHOTO_PROBE;
 use anyhow::Result;
-use chromiumoxide::{Page, layout::Point};
+use chromiumoxide::layout::Point;
 use publisher_core::UserError;
 use serde::Deserialize;
 use std::time::Duration;
@@ -145,7 +146,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn publish_click_checks_account_caption_upload_and_unique_uncovered_button() -> Result<()>
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

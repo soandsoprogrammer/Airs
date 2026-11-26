@@ -11,6 +11,8 @@ mod kuaishou_submit;
 pub mod sign_in;
 pub mod simulation;
 pub mod upload_progress;
+#[cfg(target_os = "macos")]
+pub mod webkit;
 pub mod wechat_channels;
 pub mod xiaohongshu;
 pub use douyin::Douyin;

@@ -1,3 +1,4 @@
+use crate::browser::Page;
 use crate::browser::*;
 pub use crate::douyin_publish_verification::relay_publish_verification;
 use crate::douyin_receipt::DouyinReceiptObserver;
@@ -11,7 +12,6 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::{
             dom::{DescribeNodeParams, SetFileInputFilesParams},
@@ -631,7 +631,7 @@ async fn open_creator_page(
         biased;
         _ = cancel.cancelled() => bail!("已取消"),
         browser = BrowserSession::launch(profile) => browser
-            .map_err(|_| UserError("浏览器无法启动，请检查设置中的 Chrome 程序路径".into()))?,
+            .map_err(|_| UserError("后台浏览器无法启动，请检查软件安装或浏览器设置".into()))?,
     };
     let page = tokio::select! {
         biased;
@@ -731,6 +731,27 @@ pub async fn read_login_qr(page: &Page) -> Result<Option<Vec<u8>>> {
     Ok(Some(png))
 }
 
+// An unavailable QR must not prevent manual use of the official login form.
+pub async fn official_phone_login_visible(page: &Page, origin: &str) -> Result<bool> {
+    let origin = serde_json::to_string(origin)?;
+    truth(
+        page,
+        &format!(
+            r#"((origin) => {{
+      if (location.origin !== origin) return false;
+      const visible = (node) => node.getBoundingClientRect().width > 0 &&
+          node.getBoundingClientRect().height > 0 &&
+          getComputedStyle(node).visibility === 'visible' &&
+          !node.closest('[hidden], [aria-hidden="true"], [inert]');
+      const phone = [...document.querySelectorAll('input[placeholder*="手机号"]')].some(visible);
+      const code = [...document.querySelectorAll('input[placeholder*="验证码"]')].some(visible);
+      return phone && code && /验证码登录/.test(document.body?.innerText ?? '');
+    }})({origin})"#
+        ),
+    )
+    .await
+}
+
 async fn wait_for_qr_sign_in(
     page: &Page,
     sign_in: &SignInGuard,
@@ -741,6 +762,7 @@ async fn wait_for_qr_sign_in(
         let mut next_identity_check = Instant::now();
         let mut phase = SignInStatus::Loading;
         let mut qr_seen = false;
+        let mut manual_login = false;
         let mut failures = 0;
         let mut verification_viewport = None;
         let mut verification_missing_once = false;
@@ -757,6 +779,7 @@ async fn wait_for_qr_sign_in(
                     verification_missing_once = false;
                     sign_in.update(phase, None);
                     qr_seen = false;
+                    manual_login = false;
                     page.reload().await
                         .map_err(|_| UserError("二维码刷新失败，请重新检查登录".into()))?;
                     qr_deadline = Instant::now() + Duration::from_secs(25);
@@ -774,7 +797,9 @@ async fn wait_for_qr_sign_in(
                     } else if phase == SignInStatus::VerifyInApp
                         && let Some(viewport) = verification_viewport
                         && let Ok(state) = creator_page(page).await
-                        && matches!(state.qr_status, Some(QrStatus::VerifyInApp))
+                        && (matches!(state.qr_status, Some(QrStatus::VerifyInApp))
+                            || (manual_login && state.needs_interaction
+                                && official_phone_login_visible(page, CREATOR_ORIGIN).await.unwrap_or(false)))
                     {
                         // The action comes from a person using the verification preview.
                         // Treat a navigation during dispatch as a normal page transition.
@@ -802,6 +827,7 @@ async fn wait_for_qr_sign_in(
                         return Ok(Some(state));
                     }
                     if let Some(status) = state.qr_status {
+                        manual_login = false;
                         verification_missing_once = false;
                         phase = match status {
                             QrStatus::ConfirmOnPhone => SignInStatus::ConfirmOnPhone,
@@ -823,6 +849,18 @@ async fn wait_for_qr_sign_in(
                         qr_deadline = Instant::now() + Duration::from_secs(45);
                         continue;
                     }
+                    if manual_login {
+                        if state.needs_interaction
+                            && official_phone_login_visible(page, CREATOR_ORIGIN).await.unwrap_or(false)
+                        {
+                            phase = SignInStatus::VerifyInApp;
+                            if let Ok(viewport) = capture_verification(page, sign_in).await {
+                                verification_viewport = Some(viewport);
+                            }
+                            continue;
+                        }
+                        manual_login = false;
+                    }
                     if phase == SignInStatus::VerifyInApp && !verification_missing_once {
                         // A verification document can briefly redraw between polls.
                         verification_missing_once = true;
@@ -835,6 +873,19 @@ async fn wait_for_qr_sign_in(
                         sign_in.update(phase, Some(png));
                         qr_deadline = Instant::now() + Duration::from_secs(45);
                     } else {
+                        if !qr_seen && state.needs_interaction
+                            && Instant::now() + Duration::from_secs(15) >= qr_deadline
+                            && official_phone_login_visible(page, CREATOR_ORIGIN).await.unwrap_or(false)
+                        {
+                            manual_login = true;
+                            phase = SignInStatus::VerifyInApp;
+                            sign_in.update(phase, None);
+                            sign_in.set_douyin_login_sms(None);
+                            if let Ok(viewport) = capture_verification(page, sign_in).await {
+                                verification_viewport = Some(viewport);
+                            }
+                            continue;
+                        }
                         if qr_seen || phase == SignInStatus::VerifyInApp {
                             phase = SignInStatus::CheckingAccount;
                             sign_in.update(phase, None);
@@ -1381,7 +1432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn failed_video_upload_retries_once_without_publishing() -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1458,7 +1509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn login_phone_choice_activates_only_the_current_identity_option() -> Result<()> {
         let profile = tempfile::tempdir()?;
         let mut browser = BrowserSession::launch(profile.path()).await?;
@@ -1606,14 +1657,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn verification_preview_fills_the_selected_field_without_submitting() -> Result<()> {
         let profile = tempfile::tempdir()?;
         let mut browser = BrowserSession::launch(profile.path()).await?;
         let page = browser.browser.new_page("about:blank").await?;
         page.set_content(
             r#"
-            <input id="code" value="000000" style="position:absolute;left:24px;top:24px;width:160px;height:40px">
+            <input id="code" placeholder="验证码" value="000000" style="position:absolute;left:24px;top:24px;width:160px;height:40px">
+            <input placeholder="手机号" style="position:absolute;left:220px;top:24px;width:160px;height:40px">
+            <p style="position:absolute;left:400px">验证码登录</p>
             <button id="confirm" style="position:absolute;left:24px;top:84px;width:160px;height:40px">Confirm</button>
             <script>
               const code = document.querySelector('#code');
@@ -1626,6 +1679,8 @@ mod tests {
         "#,
         )
         .await?;
+        assert!(official_phone_login_visible(&page, "null").await?);
+        assert!(!official_phone_login_visible(&page, "https://unrelated.invalid").await?);
         let sign_ins = SignIns::default();
         let sign_in = sign_ins.begin("test-account");
         let (width, height) = capture_verification(&page, &sign_in).await?;

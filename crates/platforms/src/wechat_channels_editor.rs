@@ -1,10 +1,10 @@
+use crate::browser::Page;
 use crate::{
     upload_progress::{UploadProgress, UploadProgressGuard},
     wechat_channels::CREATOR_ORIGIN,
 };
 use anyhow::Result;
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::dom::{DescribeNodeParams, SetFileInputFilesParams},
         js_protocol::runtime::EvaluateParams,
@@ -382,7 +382,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn video_editor_checks_the_uploaded_video_caption_and_both_click_targets() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);

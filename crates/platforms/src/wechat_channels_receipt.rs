@@ -1,8 +1,8 @@
 use super::CREATOR_ORIGIN;
+use crate::browser::Page;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::{
-    Page,
     cdp::browser_protocol::{
         network::{
             ConfigureDurableMessagesParams, EnableParams, EventLoadingFinished,
@@ -23,12 +23,78 @@ use std::{collections::HashMap, time::Duration};
 const MAX_MESSAGE_BYTES: usize = 128 * 1024;
 const NETWORK_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
 
-pub(super) struct Observer {
+struct ChromeObserver {
     target: TargetId,
     frames: HashMap<FrameId, LoaderId>,
     requests: EventStream<EventRequestWillBeSent>,
     responses: EventStream<EventResponseReceived>,
     finishes: EventStream<EventLoadingFinished>,
+}
+
+pub(super) struct Observer {
+    transport: Transport,
+}
+enum Transport {
+    Chrome(ChromeObserver),
+    #[cfg(target_os = "macos")]
+    WebKit(TargetId),
+}
+impl Observer {
+    pub(super) async fn start(page: &Page) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if let Some(session) = page.webkit() {
+            let url: String = session.evaluate("location.href").await?;
+            ensure!(
+                trusted_path(&url) == Some("/platform/post/create"),
+                "视频号发布页已变化"
+            );
+            session.arm_receipts(&[
+                format!("{CREATOR_ORIGIN}/micro/content/cgi-bin/mmfinderassistant-bin/post/post_create"),
+                format!("{CREATOR_ORIGIN}/cgi-bin/mmfinderassistant-bin/post/post_create"),
+            ]).await?;
+            return Ok(Self {
+                transport: Transport::WebKit(page.target_id().clone()),
+            });
+        }
+        Ok(Self {
+            transport: Transport::Chrome(ChromeObserver::start(page).await?),
+        })
+    }
+    pub(super) async fn wait_for(
+        self,
+        page: &Page,
+        description: &str,
+        short_title: Option<&str>,
+        limit: Duration,
+    ) -> Result<Option<Receipt>> {
+        match self.transport {
+            Transport::Chrome(observer) => {
+                observer
+                    .wait_for(page, description, short_title, limit)
+                    .await
+            }
+            #[cfg(target_os = "macos")]
+            Transport::WebKit(target) => {
+                ensure!(&target == page.target_id(), "视频号回执页面已变化");
+                let session = page
+                    .webkit()
+                    .ok_or_else(|| anyhow::anyhow!("WebKit 会话不可用"))?;
+                crate::webkit::wait_response(session, limit, |response| {
+                    if !is_composer_document(&response.document)
+                        || !is_create_request(&response.endpoint)
+                        || !matches_work(response.request.as_deref()?, description, short_title)
+                    {
+                        return None;
+                    }
+                    parse_receipt(GetResponseBodyReturns {
+                        body: response.body,
+                        base64_encoded: false,
+                    })
+                })
+                .await
+            }
+        }
+    }
 }
 
 struct Pending {
@@ -38,7 +104,7 @@ struct Pending {
     accepted_transport: bool,
 }
 
-impl Observer {
+impl ChromeObserver {
     pub(super) async fn start(page: &Page) -> Result<Self> {
         let tree = page.execute(GetFrameTreeParams {}).await?.result.frame_tree;
         ensure!(

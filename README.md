@@ -4,7 +4,7 @@ Airs 是面向自媒体创作者的 macOS 多平台发布工具，可统一管�
 
 Native macOS social media publisher for Douyin, Kuaishou, Xiaohongshu (RedNote), and WeChat Channels, built with Rust and GPUI Kit.
 
-已验证的桌面开发版运行在 Apple 芯片 Mac 上，采用 Rust 原生界面。抖音、快手和视频号的视频流程已用真实账号验证并收到平台接收回执。图文和小红书的真实账号发布仍待验收。
+已验证的桌面开发版运行在 Apple 芯片 Mac 上，采用 Rust 原生界面。旧 Chrome 版本的抖音、快手和视频号视频流程已用真实账号验证并收到平台接收回执。macOS 正在迁移至系统 WKWebView，四个平台的真实账号全流程需重新验收。
 
 平台的登录与发布流程参考 [social-auto-upload 的固定版本](docs/upstream.md)，由 Rust 适配器执行。
 
@@ -51,7 +51,7 @@ cargo run --locked -p social-publisher
 
 ## 浏览器与数据
 
-默认 Chrome 路径：`/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`。可在设置中修改浏览器可执行文件路径；开发时也可用 `PUBLISHER_CHROME` 提供默认值。
+macOS 15 及以上使用系统 WKWebView，不需要安装 Chrome。后台 WebKit 组件随 Airs 应用一起打包，主界面仍使用原生 Rust/GPUI Kit。升级后现有账号需要重新登录，账号名称、备注、素材和任务记录继续保留。Windows 仍在设置中指定 Chrome 可执行路径；开发时也可用 `PUBLISHER_CHROME` 提供默认值。
 
 默认数据目录：`~/Library/Application Support/com.RustSocialPublisher.SocialPublisher`。开发测试可通过 `PUBLISHER_DATA_DIR` 使用独立目录。
 
@@ -68,7 +68,7 @@ cargo run --locked -p social-publisher -- --browser-smoke
 cargo run --locked -p publisher-platforms --example probe_douyin
 ```
 
-最后三项需要本机 Chrome；抖音探测只验证空会话可访问登录页面，不登录、不上传、不提交。本地浏览器夹具测试不接触真实平台。
+最后三项在 macOS 使用系统 WKWebView，在 Windows 需要本机 Chrome；抖音探测只验证空会话可访问登录页面，不登录、不上传、不提交。本地浏览器夹具测试不接触真实平台。
 
 当前状态、验证结果与后续事项见 [开发记录](docs/verification.md)、[架构说明](docs/architecture.md) 和 [上游版本记录](docs/upstream.md)。
 

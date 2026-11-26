@@ -1,8 +1,8 @@
 use super::CREATOR_ORIGIN;
+use crate::browser::Page;
 use crate::upload_progress::{UploadProgress, UploadProgressRegistry};
 use anyhow::Result;
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::{
             dom::{
@@ -389,7 +389,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn prepares_two_images_in_order_and_uses_the_closed_shadow_publish_button() -> Result<()>
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

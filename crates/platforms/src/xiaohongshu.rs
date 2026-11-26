@@ -1,7 +1,7 @@
+use crate::browser::Page;
 use crate::{browser::BrowserSession, sign_in::SignIns, upload_progress::UploadProgressRegistry};
 use anyhow::Result;
 use async_trait::async_trait;
-use chromiumoxide::Page;
 use publisher_core::{
     Account, Capabilities, Job, JobState, PlatformAdapter, Prepared, Receipt, RunContext,
     SessionStatus, Store, UserError,

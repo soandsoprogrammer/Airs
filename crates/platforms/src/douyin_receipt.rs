@@ -1,6 +1,6 @@
+use crate::browser::Page;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::{
     network::{
         ConfigureDurableMessagesParams, EnableParams, EventLoadingFinished, EventRequestWillBeSent,
@@ -22,7 +22,7 @@ const MAX_NETWORK_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
 
 /// Correlates a publish response with its POST in the prepared top-level page.
 /// The observer does not click, submit, navigate, or retry any platform operation.
-pub struct DouyinReceiptObserver {
+pub(crate) struct ChromeObserver {
     target_id: TargetId,
     frame_id: FrameId,
     loader_id: LoaderId,
@@ -32,12 +32,64 @@ pub struct DouyinReceiptObserver {
     finishes: EventStream<EventLoadingFinished>,
 }
 
+pub(crate) enum DouyinReceiptObserver {
+    Chrome(ChromeObserver),
+    #[cfg(target_os = "macos")]
+    WebKit {
+        target: TargetId,
+        media_kind: MediaKind,
+    },
+}
+impl DouyinReceiptObserver {
+    pub async fn start(page: &Page) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if let Some(session) = page.webkit() {
+            let url: String = session.evaluate("location.href").await?;
+            let media_kind =
+                composer_kind(&url).ok_or_else(|| anyhow::anyhow!("抖音发布页已变化"))?;
+            session
+                .arm_receipts(&[
+                    format!("{CREATOR_ORIGIN}web/api/media/aweme/create"),
+                    format!("{CREATOR_ORIGIN}web/api/media/aweme/create_v2"),
+                ])
+                .await?;
+            return Ok(Self::WebKit {
+                target: page.target_id().clone(),
+                media_kind,
+            });
+        }
+        Ok(Self::Chrome(ChromeObserver::start(page).await?))
+    }
+    pub async fn wait_for(self, page: &Page, limit: Duration) -> Result<Option<Receipt>> {
+        match self {
+            Self::Chrome(observer) => observer.wait_for(page, limit).await,
+            #[cfg(target_os = "macos")]
+            Self::WebKit { target, media_kind } => {
+                ensure!(&target == page.target_id(), "抖音回执页面已变化");
+                let session = page
+                    .webkit()
+                    .ok_or_else(|| anyhow::anyhow!("WebKit 会话不可用"))?;
+                crate::webkit::wait_response(session, limit, |response| {
+                    if composer_kind(&response.document) != Some(media_kind)
+                        || publish_operation(&response.endpoint).is_none()
+                        || response.body.len() > MAX_RECEIPT_BYTES
+                    {
+                        return None;
+                    }
+                    receipt_from_response(&serde_json::from_str(&response.body).ok()?)
+                })
+                .await
+            }
+        }
+    }
+}
+
 struct PendingReceipt {
     operation: &'static str,
     successful_response: bool,
 }
 
-impl DouyinReceiptObserver {
+impl ChromeObserver {
     /// Arm this observer immediately before clicking the prepared page's publish button.
     pub async fn start(page: &Page) -> Result<Self> {
         let frame = page
@@ -78,10 +130,6 @@ impl DouyinReceiptObserver {
     }
 
     /// Wait for evidence of platform acceptance. Missing evidence remains unknown.
-    pub async fn wait(self, page: &Page) -> Result<Option<Receipt>> {
-        self.wait_for(page, Duration::from_secs(90)).await
-    }
-
     /// Allow more time for a manually completed platform verification.
     pub async fn wait_for(mut self, page: &Page, timeout: Duration) -> Result<Option<Receipt>> {
         ensure!(

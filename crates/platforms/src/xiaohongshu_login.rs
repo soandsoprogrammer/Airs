@@ -1,11 +1,11 @@
 use super::{CREATOR_ORIGIN, HOME_URL};
+use crate::browser::Page;
 use crate::{
     douyin::read_verification_frame,
     sign_in::{SignInGuard, SignInStatus, VerificationAction},
 };
 use anyhow::Result;
 use chromiumoxide::{
-    Page,
     cdp::browser_protocol::{
         input::InsertTextParams,
         page::{CaptureScreenshotFormat, Viewport},
@@ -243,7 +243,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn official_switch_is_hit_tested_and_the_qr_is_cropped() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);

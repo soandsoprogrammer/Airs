@@ -1,9 +1,9 @@
+use crate::browser::Page;
 use crate::kuaishou_prepare::{caption, dismiss_publish_guide, upload_timeout};
 use crate::kuaishou_receipt::{AtlasIdentity, AtlasUploadObserver};
 use crate::upload_progress::{UploadProgress, UploadProgressGuard, UploadProgressRegistry};
 use anyhow::Result;
 use chromiumoxide::{
-    Page,
     cdp::{
         browser_protocol::{
             dom::{DescribeNodeParams, SetFileInputFilesParams},
@@ -100,6 +100,25 @@ async fn select_photos(
         .await?
         .node
         .backend_node_id;
+    #[cfg(target_os = "macos")]
+    if let Some(session) = page.webkit() {
+        let node = serde_json::to_string(&input)?;
+        let point = page
+            .evaluate_expression(expression(origin, "uploadButtonPoint", ""))
+            .await?
+            .into_value::<Option<[f64; 2]>>()?
+            .ok_or_else(|| UserError("快手的上传图片按钮暂时不可操作。".into()))?;
+        let paths = files
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        let element = format!("globalThis.__airsDomRefs?.get({node})");
+        return tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(UserError("已取消快手图文准备。".into()).into()),
+            result = session.choose_files_at(&element, &paths, Some(point)) => result,
+        };
+    }
     let mut chooser = page.event_listener::<EventFileChooserOpened>().await?;
     page.execute(SetInterceptFileChooserDialogParams::new(true))
         .await?;
@@ -313,7 +332,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome；使用 --ignored 显式运行"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）；使用 --ignored 显式运行"]
     async fn ordered_photos_wait_for_upload_and_require_unchanged_public_composer() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);

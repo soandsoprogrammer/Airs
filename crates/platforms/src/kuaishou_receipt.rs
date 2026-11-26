@@ -1,6 +1,6 @@
+use crate::browser::Page;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::{
     network::{
         ConfigureDurableMessagesParams, EnableParams, EventLoadingFinished, EventRequestWillBeSent,
@@ -27,7 +27,7 @@ pub(crate) struct AtlasIdentity {
     atlas_id: String,
 }
 
-pub(crate) struct KuaishouReceiptObserver {
+struct ChromeReceiptObserver {
     target_id: TargetId,
     frame_id: FrameId,
     loader_id: LoaderId,
@@ -38,13 +38,109 @@ pub(crate) struct KuaishouReceiptObserver {
     finishes: EventStream<EventLoadingFinished>,
 }
 
+pub(crate) struct KuaishouReceiptObserver {
+    transport: ReceiptTransport,
+}
+enum ReceiptTransport {
+    Chrome(ChromeReceiptObserver),
+    #[cfg(target_os = "macos")]
+    WebKit {
+        target: TargetId,
+        caption: String,
+        atlas: Option<AtlasIdentity>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+fn endpoints(paths: &[&str]) -> Vec<String> {
+    paths
+        .iter()
+        .flat_map(|path| {
+            [
+                format!("{CREATOR_ORIGIN}{path}"),
+                format!("{CREATOR_ORIGIN}forward/cp/{path}"),
+            ]
+        })
+        .collect()
+}
+impl KuaishouReceiptObserver {
+    pub(crate) async fn start(
+        page: &Page,
+        caption: &str,
+        atlas: Option<&AtlasIdentity>,
+    ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if let Some(session) = page.webkit() {
+            let url: String = session.evaluate("location.href").await?;
+            ensure!(is_composer(&url, atlas.is_some()), "快手发布页已变化");
+            let caption = normalize_caption(caption);
+            ensure!(!caption.is_empty(), "快手作品描述为空");
+            let paths = if atlas.is_some() {
+                endpoints(&["rest/cp/works/atlas/pc/publish/submit"])
+            } else {
+                endpoints(&[
+                    "rest/cp/works/v2/video/pc/submit",
+                    "rest/cp/works/v3/video/pc/submit",
+                    "rest/cp/works/v2/video/pc/isolation/submit",
+                ])
+            };
+            session.arm_receipts(&paths).await?;
+            return Ok(Self {
+                transport: ReceiptTransport::WebKit {
+                    target: page.target_id().clone(),
+                    caption,
+                    atlas: atlas.cloned(),
+                },
+            });
+        }
+        Ok(Self {
+            transport: ReceiptTransport::Chrome(
+                ChromeReceiptObserver::start(page, caption, atlas).await?,
+            ),
+        })
+    }
+    pub(crate) async fn wait_for(self, page: &Page, limit: Duration) -> Result<Option<Receipt>> {
+        match self.transport {
+            ReceiptTransport::Chrome(observer) => observer.wait_for(page, limit).await,
+            #[cfg(target_os = "macos")]
+            ReceiptTransport::WebKit {
+                target,
+                caption,
+                atlas,
+            } => {
+                ensure!(&target == page.target_id(), "快手回执页面已变化");
+                let session = page
+                    .webkit()
+                    .ok_or_else(|| anyhow::anyhow!("WebKit 会话不可用"))?;
+                crate::webkit::wait_response(session, limit, |response| {
+                    if !is_composer(&response.document, atlas.is_some())
+                        || (publish_operation(&response.endpoint)? == "atlas") != atlas.is_some()
+                        || !matches_prepared_work(
+                            response.request.as_deref()?,
+                            &caption,
+                            atlas.as_ref(),
+                        )
+                    {
+                        return None;
+                    }
+                    receipt_from_body(GetResponseBodyReturns {
+                        body: response.body,
+                        base64_encoded: false,
+                    })
+                })
+                .await
+            }
+        }
+    }
+}
+
 struct PendingReceipt {
     id: RequestId,
     operation: &'static str,
     accepted_transport: bool,
 }
 
-impl KuaishouReceiptObserver {
+impl ChromeReceiptObserver {
     pub(crate) async fn start(
         page: &Page,
         caption: &str,
@@ -291,7 +387,7 @@ fn decode_response(body: GetResponseBodyReturns) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub(crate) struct AtlasUploadObserver {
+struct ChromeAtlasObserver {
     frame_id: FrameId,
     loader_id: LoaderId,
     requests: EventStream<EventRequestWillBeSent>,
@@ -299,7 +395,60 @@ pub(crate) struct AtlasUploadObserver {
     finishes: EventStream<EventLoadingFinished>,
 }
 
+pub(crate) struct AtlasUploadObserver {
+    transport: AtlasTransport,
+}
+enum AtlasTransport {
+    Chrome(ChromeAtlasObserver),
+    #[cfg(target_os = "macos")]
+    WebKit(TargetId),
+}
 impl AtlasUploadObserver {
+    pub(crate) async fn start(page: &Page) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        if let Some(session) = page.webkit() {
+            let url: String = session.evaluate("location.href").await?;
+            ensure!(is_composer(&url, true), "当前页面不是快手图文编辑页");
+            session
+                .arm_receipts(&endpoints(&["rest/cp/works/atlas/pc/upload/pre"]))
+                .await?;
+            return Ok(Self {
+                transport: AtlasTransport::WebKit(page.target_id().clone()),
+            });
+        }
+        Ok(Self {
+            transport: AtlasTransport::Chrome(ChromeAtlasObserver::start(page).await?),
+        })
+    }
+    pub(crate) async fn wait(self, page: &Page, count: usize) -> Option<AtlasIdentity> {
+        match self.transport {
+            AtlasTransport::Chrome(observer) => observer.wait(page, count).await,
+            #[cfg(target_os = "macos")]
+            AtlasTransport::WebKit(target) => {
+                if &target != page.target_id() {
+                    return None;
+                }
+                crate::webkit::wait_response(page.webkit()?, Duration::from_secs(120), |response| {
+                    if !is_composer(&response.document, true)
+                        || !is_atlas_upload_pre(&response.endpoint)
+                        || !is_fresh_atlas_request(response.request.as_deref()?, count)
+                    {
+                        return None;
+                    }
+                    let value = decode_response(GetResponseBodyReturns {
+                        body: response.body,
+                        base64_encoded: false,
+                    })?;
+                    atlas_upload_identity(&value, count)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        }
+    }
+}
+impl ChromeAtlasObserver {
     pub(crate) async fn start(page: &Page) -> Result<Self> {
         let frame = page
             .execute(GetFrameTreeParams {})
@@ -538,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome；使用 --ignored 显式运行"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）；使用 --ignored 显式运行"]
     async fn request_body_can_be_read_only_after_matching_the_post() -> Result<()> {
         use crate::browser::BrowserSession;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -560,6 +709,22 @@ mod tests {
         let profile = tempfile::tempdir()?;
         let mut browser = BrowserSession::launch(profile.path()).await?;
         let page = browser.browser.new_page(url).await?;
+        #[cfg(target_os = "macos")]
+        if let Some(session) = page.webkit() {
+            let base: String = session.evaluate("location.origin").await?;
+            session.arm_receipts(&[format!("{base}/fixture")]).await?;
+            page.evaluate_expression("fetch('/fixture', {method:'POST', body:JSON.stringify({fileId:321,caption:'本地测试'})}).then(()=>null)").await?;
+            let matched =
+                crate::webkit::wait_response(session, Duration::from_secs(5), |response| {
+                    matches_prepared_work(response.request.as_deref()?, "本地测试", None)
+                        .then_some(())
+                })
+                .await?;
+            assert!(matched.is_some());
+            browser.close().await?;
+            server.abort();
+            return Ok(());
+        }
         let mut requests = page.event_listener::<EventRequestWillBeSent>().await?;
         page.execute(EnableParams {
             max_post_data_size: Some(0),

@@ -1,4 +1,5 @@
 use crate::browser::BrowserSession;
+use crate::browser::Page;
 use crate::douyin::read_verification_frame;
 use crate::kuaishou_prepare::{dismiss_publish_guide, prepare_video, upload_timeout};
 use crate::kuaishou_receipt::KuaishouReceiptObserver;
@@ -8,7 +9,6 @@ use crate::upload_progress::UploadProgressRegistry;
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chromiumoxide::Page;
 use publisher_core::{
     Account, Capabilities, Content, Job, JobState, MediaKind, PlatformAdapter, Prepared, Receipt,
     RunContext, SessionStatus, Store, UserError,
@@ -423,7 +423,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    #[ignore = "需要本机 Chrome"]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
     async fn login_probes_only_trusted_creator_and_passport_controls() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let origin = format!("http://{}", listener.local_addr()?);

@@ -1,5 +1,8 @@
 //! Check whether a fresh background session can recognize Douyin's sign-in screen.
-use publisher_platforms::{browser::BrowserSession, douyin::read_login_qr};
+use publisher_platforms::{
+    browser::BrowserSession,
+    douyin::{official_phone_login_visible, read_login_qr},
+};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -25,6 +28,12 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::ensure!(state["authenticated"] != true, "空会话不应识别为已登录");
                 if state["needsInteraction"] == true && read_login_qr(&page).await?.is_some() {
                     println!("抖音空会话已在后台取得登录二维码");
+                    return Ok(());
+                }
+                if state["needsInteraction"] == true
+                    && official_phone_login_visible(&page, "https://creator.douyin.com").await?
+                {
+                    println!("抖音空会话已识别官方手机验证码登录表单");
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
