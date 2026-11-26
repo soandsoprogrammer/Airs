@@ -100,6 +100,21 @@ final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageH
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 self.finishFrame(token, "Frame resolution timed out")
             }
+        case "armDouyinWorkList":
+            guard view.url == nil || view.url?.absoluteString == "about:blank",
+                  let title = r["title"] as? String, !title.isEmpty, title.count <= 256,
+                  let description = r["description"] as? String, description.count <= 4096,
+                  let since = r["since"] as? Int, let until = r["until"] as? Int,
+                  since > 0, until >= since, until - since <= 900,
+                  let data = try? JSONSerialization.data(withJSONObject:
+                    ["title": title, "description": description, "since": since, "until": until]),
+                  let parameters = String(data: data, encoding: .utf8) else {
+                reply(nil, "Invalid read-only work lookup"); return
+            }
+            let source = "(\(workListMonitor))(\(parameters),(\(matchDouyinWorks)))"
+            view.configuration.userContentController.addUserScript(WKUserScript(
+                source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            reply(true, nil)
         case "armReceipts":
             guard let endpoints = r["endpoints"] as? [String], !endpoints.isEmpty, endpoints.count <= 12,
                   let doc = view.url, let scheme = doc.scheme, let host = doc.host else {

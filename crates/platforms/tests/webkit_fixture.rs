@@ -194,3 +194,59 @@ async fn native_webkit_upload_input_and_isolation() -> anyhow::Result<()> {
     second_cleanup?;
     Ok(())
 }
+
+#[tokio::test]
+async fn douyin_work_list_requires_unique_new_published_content() -> anyhow::Result<()> {
+    let session = Session::launch(Uuid::new_v4(), false).await?;
+    session.navigate("about:blank").await?;
+    let matcher = include_str!("../webkit/douyin-work-list.js");
+    let criteria = serde_json::json!({
+        "title": "测试视频", "description": "测试说明 #测试",
+        "since": 1000, "until": 1200
+    });
+    let work = |id: Value, time: u64| {
+        serde_json::json!({
+            "aweme_id": id, "create_time": time, "item_title": "测试视频",
+            "desc": "测试视频  测试说明 #测试", "aweme_type": 4, "status_value": 102,
+            "status": {"is_delete": false, "is_private": false, "is_prohibited": false}
+        })
+    };
+    let expected = work(serde_json::json!("1234567890123456789"), 1100);
+    let mut wrong = work(serde_json::json!("1234567890123456790"), 1101);
+    wrong["desc"] = "不同文案".into();
+    let mut pending = work(serde_json::json!("1234567890123456791"), 1102);
+    pending["status_value"] = 101.into();
+    let mut private = work(serde_json::json!("1234567890123456792"), 1103);
+    private["status"]["is_private"] = true.into();
+    let rows = vec![
+        work(serde_json::json!("1234567890123456793"), 999),
+        work(serde_json::json!("1234567890123456794"), 1201),
+        work(serde_json::json!(1234567890123456795u64), 1104),
+        wrong,
+        pending,
+        private,
+        expected.clone(),
+    ];
+    let payload = serde_json::json!({"status_code": 0, "aweme_list": rows});
+    let result: Value = session
+        .evaluate(&format!("({matcher})({criteria},{payload})"))
+        .await?;
+    assert_eq!(
+        result,
+        serde_json::json!([{"id":"1234567890123456789","createdAt":1100}])
+    );
+    let ambiguous = serde_json::json!({"status_code":0,"aweme_list":[expected,work(serde_json::json!("1234567890123456796"), 1105)]});
+    let result: Vec<Value> = session
+        .evaluate(&format!("({matcher})({criteria},{ambiguous})"))
+        .await?;
+    assert_eq!(result.len(), 2);
+    let failed = serde_json::json!({"status_code":1,"aweme_list":[]});
+    assert!(
+        session
+            .evaluate::<Value>(&format!("({matcher})({criteria},{failed})"))
+            .await?
+            .is_null()
+    );
+    session.close().await?;
+    Ok(())
+}

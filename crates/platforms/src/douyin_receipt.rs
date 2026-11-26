@@ -50,7 +50,9 @@ impl DouyinReceiptObserver {
             session
                 .arm_receipts(&[
                     format!("{CREATOR_ORIGIN}web/api/media/aweme/create"),
+                    format!("{CREATOR_ORIGIN}web/api/media/aweme/create/"),
                     format!("{CREATOR_ORIGIN}web/api/media/aweme/create_v2"),
+                    format!("{CREATOR_ORIGIN}web/api/media/aweme/create_v2/"),
                 ])
                 .await?;
             return Ok(Self::WebKit {

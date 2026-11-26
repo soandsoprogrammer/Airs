@@ -1,6 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-changed=webkit/host.swift");
     println!("cargo:rerun-if-changed=webkit/receipt-monitor.js");
+    println!("cargo:rerun-if-changed=webkit/work-list-monitor.js");
+    println!("cargo:rerun-if-changed=webkit/douyin-work-list.js");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -13,12 +15,22 @@ fn main() {
         _ => panic!("Unsupported macOS architecture: {architecture}"),
     };
     let monitor = std::fs::read_to_string("webkit/receipt-monitor.js").expect("receipt monitor");
+    let work_list =
+        std::fs::read_to_string("webkit/work-list-monitor.js").expect("work list monitor");
+    let match_works =
+        std::fs::read_to_string("webkit/douyin-work-list.js").expect("work list matcher");
     let script = out.with_file_name("ReceiptMonitor.swift");
     std::fs::write(
         &script,
         format!(
             r##"let receiptMonitor = #"""
 {monitor}
+"""#
+let workListMonitor = #"""
+{work_list}
+"""#
+let matchDouyinWorks = #"""
+{match_works}
 """#
 "##
         ),

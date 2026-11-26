@@ -1356,6 +1356,8 @@ impl PlatformAdapter for Douyin {
             account_id: ctx.job.account.id.clone(),
             publish_attempted: false,
             receipt_observer: None,
+            #[cfg(target_os = "macos")]
+            submitted_at: 0,
         }))
     }
 }
@@ -1369,6 +1371,8 @@ struct DouyinPrepared {
     account_id: String,
     publish_attempted: bool,
     receipt_observer: Option<DouyinReceiptObserver>,
+    #[cfg(target_os = "macos")]
+    submitted_at: u64,
 }
 #[async_trait]
 impl Prepared for DouyinPrepared {
@@ -1394,6 +1398,10 @@ impl Prepared for DouyinPrepared {
         );
         video_cover::verify(&self.page, CREATOR_ORIGIN, &self.covers).await?;
         self.publish_attempted = true;
+        #[cfg(target_os = "macos")]
+        {
+            self.submitted_at = crate::douyin_work_list::unix_now();
+        }
         click_publish(&self.page, &self.content, self.photos.as_ref()).await
     }
     async fn inspect_result(&mut self) -> Result<Option<Receipt>> {
@@ -1403,6 +1411,27 @@ impl Prepared for DouyinPrepared {
         let Some(observer) = self.receipt_observer.take() else {
             return Ok(None);
         };
+        #[cfg(target_os = "macos")]
+        if self.page.webkit().is_some() && self.content.asset.kind == MediaKind::Video {
+            // A WebKit transport observer may miss a response during document
+            // transitions. Keep the original page alive for any user checks,
+            // while independently verifying the official work list.
+            let transport = async {
+                if let Ok(Some(receipt)) = observer
+                    .wait_for(&self.page, self.submission_timeout())
+                    .await
+                {
+                    return Ok(Some(receipt));
+                }
+                std::future::pending().await
+            };
+            return tokio::select! {
+                biased;
+                receipt = transport => receipt,
+                receipt = crate::douyin_work_list::wait(&self.account_id, &self.content, self.submitted_at) => Ok(receipt),
+                _ = relay_publish_verification(&self.page, &self.sign_ins, &self.account_id) => Ok(None),
+            };
+        }
         tokio::select! {
             biased;
             receipt = observer.wait_for(&self.page, self.submission_timeout()) => receipt,

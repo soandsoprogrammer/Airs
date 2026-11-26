@@ -4,6 +4,8 @@ mod douyin_publish_verification;
 pub mod douyin_receipt;
 pub mod douyin_submit;
 mod douyin_video_topics;
+#[cfg(target_os = "macos")]
+mod douyin_work_list;
 pub mod kuaishou;
 mod kuaishou_prepare;
 mod kuaishou_receipt;

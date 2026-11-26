@@ -213,6 +213,23 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) async fn arm_douyin_work_list(
+        &self,
+        title: &str,
+        description: &str,
+        since: u64,
+        until: u64,
+    ) -> Result<()> {
+        self.call::<bool>(
+            "armDouyinWorkList",
+            json!({
+                "title": title, "description": description, "since": since, "until": until
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn show_douyin_login(&self) -> Result<()> {
         self.call::<bool>("showDouyinLogin", json!({})).await?;
         Ok(())
