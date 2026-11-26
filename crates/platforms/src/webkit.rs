@@ -213,6 +213,16 @@ impl Session {
         Ok(())
     }
 
+    pub async fn show_douyin_login(&self) -> Result<()> {
+        self.call::<bool>("showDouyinLogin", json!({})).await?;
+        Ok(())
+    }
+
+    pub async fn hide_douyin_login(&self) -> Result<()> {
+        self.call::<bool>("hideDouyinLogin", json!({})).await?;
+        Ok(())
+    }
+
     pub async fn screenshot(&self, clip: Option<[f64; 4]>) -> Result<Vec<u8>> {
         let clip = clip.map(|[x, y, width, height]| {
             json!({

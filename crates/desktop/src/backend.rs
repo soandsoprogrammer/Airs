@@ -375,6 +375,9 @@ impl Worker {
                     VerificationAction::FillText(_) => {
                         Some("暂时无法填入文字，请检查验证页面后重试")
                     }
+                    VerificationAction::OpenNativeDouyinLogin => {
+                        Some("本次登录窗口已失效，请重新检查登录")
+                    }
                     VerificationAction::DouyinLoginSms(_) => {
                         Some("抖音验证选项已变化，请查看当前页面")
                     }

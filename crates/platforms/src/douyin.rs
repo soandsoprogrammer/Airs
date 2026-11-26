@@ -731,6 +731,37 @@ pub async fn read_login_qr(page: &Page) -> Result<Option<Vec<u8>>> {
     Ok(Some(png))
 }
 
+// WebKit pauses the official login card's decorative entrance animation when
+// its window is hidden. Finish only that finite opacity transition; never
+// reveal hidden challenges, change form state, or trigger authentication.
+pub async fn finish_login_entrance(page: &Page, origin: &str) -> Result<bool> {
+    let origin = serde_json::to_string(origin)?;
+    truth(page, &format!(r#"((origin) => {{
+      if (location.origin !== origin) return false;
+      const fields = [...document.querySelectorAll('input[placeholder*="手机号"]')]
+        .filter(e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0 &&
+          getComputedStyle(e).visibility === 'visible' && !e.closest('[hidden], [aria-hidden="true"], [inert]'));
+      if (fields.length !== 1) return false;
+      for (let card = fields[0].parentElement; card && card !== document.body; card = card.parentElement) {{
+        if (!getComputedStyle(card).animationName.startsWith('login-enter-') ||
+            getComputedStyle(card).opacity !== '0') continue;
+        const animations = card.getAnimations().filter(a => {{
+          if (!a.animationName?.startsWith('login-enter-') || a.effect?.target !== card) return false;
+          const timing = a.effect.getTiming();
+          const keys = a.effect.getKeyframes();
+          return timing.iterations === 1 && typeof timing.duration === 'number' &&
+            timing.duration > 0 && timing.duration <= 2000 &&
+            ['both', 'forwards'].includes(timing.fill) && keys.length === 2 &&
+            Number(keys[0].opacity) === 0 && Number(keys[1].opacity) === 1;
+        }});
+        if (animations.length !== 1) return false;
+        animations[0].finish();
+        return getComputedStyle(card).opacity === '1';
+      }}
+      return false;
+    }})({origin})"#)).await
+}
+
 // An unavailable QR must not prevent manual use of the official login form.
 pub async fn official_phone_login_visible(page: &Page, origin: &str) -> Result<bool> {
     let origin = serde_json::to_string(origin)?;
@@ -775,6 +806,10 @@ async fn wait_for_qr_sign_in(
                         continue;
                     }
                     phase = SignInStatus::Loading;
+                    #[cfg(target_os = "macos")]
+                    if let Some(session) = page.webkit() {
+                        let _ = session.hide_douyin_login().await;
+                    }
                     verification_viewport = None;
                     verification_missing_once = false;
                     sign_in.update(phase, None);
@@ -785,7 +820,20 @@ async fn wait_for_qr_sign_in(
                     qr_deadline = Instant::now() + Duration::from_secs(25);
                 }
                 Some(action) = sign_in.verification_action() => {
-                    let feedback = if let VerificationAction::DouyinLoginSms(step) = action {
+                    let feedback = if matches!(action, VerificationAction::OpenNativeDouyinLogin) {
+                        #[cfg(target_os = "macos")]
+                        if phase == SignInStatus::VerifyInApp
+                            && let Some(session) = page.webkit()
+                            && let Ok(state) = creator_page(page).await
+                            && state.needs_interaction
+                            && session.show_douyin_login().await.is_ok()
+                        {
+                            sign_in.set_input_feedback(Some("请在 Airs 验证窗口扫码或输入验证码。"));
+                            ticker.reset_immediately();
+                            continue;
+                        }
+                        Some("暂时无法打开验证窗口，请重新检查登录。")
+                    } else if let VerificationAction::DouyinLoginSms(step) = action {
                         if phase == SignInStatus::VerifyInApp
                             && click_login_sms(page, CREATOR_ORIGIN, step).await
                         {
@@ -824,7 +872,18 @@ async fn wait_for_qr_sign_in(
                         }
                     };
                     if state.authenticated {
+                        #[cfg(target_os = "macos")]
+                        if let Some(session) = page.webkit() {
+                            let _ = session.hide_douyin_login().await;
+                        }
                         return Ok(Some(state));
+                    }
+                    #[cfg(target_os = "macos")]
+                    if state.needs_interaction && page.webkit().is_some()
+                        && finish_login_entrance(page, CREATOR_ORIGIN).await.unwrap_or(false)
+                    {
+                        // Let WebKit present the final animation frame before capturing it.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
                     }
                     if let Some(status) = state.qr_status {
                         manual_login = false;
@@ -837,6 +896,8 @@ async fn wait_for_qr_sign_in(
                         };
                         sign_in.update(phase, None);
                         if phase == SignInStatus::VerifyInApp {
+                            #[cfg(target_os = "macos")]
+                            sign_in.allow_native_douyin_login(page.webkit().is_some());
                             sign_in.set_douyin_login_sms(
                                 login_sms_control(page, CREATOR_ORIGIN).await.map(|control| control.preview)
                             );
@@ -880,6 +941,8 @@ async fn wait_for_qr_sign_in(
                             manual_login = true;
                             phase = SignInStatus::VerifyInApp;
                             sign_in.update(phase, None);
+                            #[cfg(target_os = "macos")]
+                            sign_in.allow_native_douyin_login(page.webkit().is_some());
                             sign_in.set_douyin_login_sms(None);
                             if let Ok(viewport) = capture_verification(page, sign_in).await {
                                 verification_viewport = Some(viewport);
@@ -1150,7 +1213,7 @@ impl PlatformAdapter for Douyin {
                     .sync_session(&ctx.job.account.id, SessionStatus::NeedsLogin, None)?;
                 ctx.stage(
                     JobState::WaitingUser,
-                    "请在任务卡片中使用抖音 App 扫码，登录后会自动继续准备",
+                    "请在任务卡片中完成抖音登录，可使用扫码或手机验证码，登录后自动继续准备",
                 )
             },
         )
@@ -1652,6 +1715,46 @@ mod tests {
         assert!(truth(&page, "actions.join() === 'opened'").await?);
         assert!(click_login_sms(&page, "null", sent).await);
         assert!(truth(&page, "actions.join() === 'opened,confirmed'").await?);
+        browser.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "需要平台后台浏览器（macOS WebKit / Windows Chrome）"]
+    async fn frozen_login_transition_is_completed_without_changing_form() -> Result<()> {
+        let profile = tempfile::tempdir()?;
+        let mut browser = BrowserSession::launch(profile.path()).await?;
+        let page = browser.browser.new_page("about:blank").await?;
+        page.set_content(r#"
+            <style>
+              @keyframes login-enter-fixture { from { opacity: 0 } to { opacity: 1 } }
+              #login { animation: login-enter-fixture 760ms both paused; width: 320px; height: 200px; }
+              #unrelated { animation: login-enter-fixture 760ms both paused; }
+            </style>
+            <div id="login"><input placeholder="手机号" id="phone">
+            <input placeholder="验证码" id="code"><button id="submit">登录</button></div>
+            <div id="unrelated">其他动画</div>
+            <script>window.submitted=0;document.querySelector('#submit').onclick=()=>window.submitted++;</script>
+        "#).await?;
+        assert!(
+            truth(
+                &page,
+                "getComputedStyle(document.querySelector('#login')).opacity === '0'"
+            )
+            .await?
+        );
+        assert!(!finish_login_entrance(&page, "https://unrelated.invalid").await?);
+        assert!(finish_login_entrance(&page, "null").await?);
+        assert!(truth(&page, "getComputedStyle(document.querySelector('#login')).opacity === '1' && getComputedStyle(document.querySelector('#unrelated')).opacity === '0' && submitted === 0").await?);
+        let point:[f64;2] = page.evaluate_expression("(()=>{let r=document.querySelector('#phone').getBoundingClientRect();return [r.x+r.width/2,r.y+r.height/2]})()").await?.into_value()?;
+        page.click(Point::new(point[0], point[1])).await?;
+        assert!(
+            truth(
+                &page,
+                "document.activeElement.id === 'phone' && submitted === 0"
+            )
+            .await?
+        );
         browser.close().await?;
         Ok(())
     }

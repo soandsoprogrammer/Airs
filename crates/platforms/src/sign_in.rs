@@ -26,6 +26,7 @@ pub struct SignInPreview {
     pub verification_id: Option<u64>,
     pub input_feedback: Option<&'static str>,
     pub douyin_login_sms: Option<DouyinLoginSmsPreview>,
+    pub native_douyin_login: bool,
     pub publish_sms: Option<PublishSmsPreview>,
     pub wechat_channels: Option<WechatChannelsPreview>,
 }
@@ -42,6 +43,7 @@ impl SignInPreview {
             self.verification_id = None;
             self.input_feedback = None;
             self.douyin_login_sms = None;
+            self.native_douyin_login = false;
             self.publish_sms = None;
             self.wechat_channels = None;
         }
@@ -56,6 +58,7 @@ impl SignInPreview {
                 VerificationAction::VerifySmsCode(_) => {
                     self.publish_sms.is_some_and(|sms| sms.can_verify)
                 }
+                VerificationAction::OpenNativeDouyinLogin => self.native_douyin_login,
                 VerificationAction::Click { .. } => self.verification.is_some(),
                 VerificationAction::FillText(_) => {
                     self.verification.is_some() && self.douyin_login_sms.is_none()
@@ -137,6 +140,7 @@ pub enum VerificationAction {
     Click { x: f64, y: f64 },
     FillText(String),
     DouyinLoginSms(DouyinLoginSms),
+    OpenNativeDouyinLogin,
     RequestSmsCode,
     VerifySmsCode(String),
     WechatQuickLogin,
@@ -260,6 +264,12 @@ impl SignInGuard {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn allow_native_douyin_login(&self, allowed: bool) {
+        let mut preview = self.entry.preview.lock().unwrap();
+        preview.native_douyin_login = allowed && preview.status == SignInStatus::VerifyInApp;
+    }
+
     pub(crate) fn set_douyin_login_sms(&self, sms: Option<DouyinLoginSmsPreview>) {
         let mut preview = self.entry.preview.lock().unwrap();
         if preview.status == SignInStatus::VerifyInApp {
@@ -319,6 +329,36 @@ impl Drop for SignInGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_login_requires_the_active_login_preview() {
+        let sign_ins = SignIns::default();
+        let guard = sign_ins.begin("douyin");
+        guard.update(SignInStatus::VerifyInApp, None);
+        let id = sign_ins.snapshot()["douyin"].verification_id.unwrap();
+        assert!(!sign_ins.send_verification_action(
+            "douyin",
+            id,
+            VerificationAction::OpenNativeDouyinLogin
+        ));
+        guard.allow_native_douyin_login(true);
+        assert!(sign_ins.send_verification_action(
+            "douyin",
+            id,
+            VerificationAction::OpenNativeDouyinLogin
+        ));
+        assert!(matches!(
+            guard.verification_action().await,
+            Some(VerificationAction::OpenNativeDouyinLogin)
+        ));
+        guard.update(SignInStatus::CheckingAccount, None);
+        assert!(!sign_ins.send_verification_action(
+            "douyin",
+            id,
+            VerificationAction::OpenNativeDouyinLogin
+        ));
+    }
 
     #[tokio::test]
     async fn wechat_login_accepts_only_the_current_accounts_available_choice() {

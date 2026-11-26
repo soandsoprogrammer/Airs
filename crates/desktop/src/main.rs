@@ -820,6 +820,39 @@ impl Publisher {
                         _ => "抖音登录与安全验证",
                     }),
             )
+            .when_some(
+                preview
+                    .verification_id
+                    .filter(|_| preview.native_douyin_login && platform == Platform::Douyin),
+                |panel, verification_id| {
+                    let account = account_id.to_owned();
+                    panel.child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_3()
+                            .flex_wrap()
+                            .child(
+                                Button::new(eid("open-native-douyin-login", panel_id))
+                                    .primary()
+                                    .label("打开 Airs 扫码窗口")
+                                    .on_click(cx.listener(move |s, _, _, _| {
+                                        s.backend.send(Command::VerificationInput(
+                                            account.clone(),
+                                            verification_id,
+                                            VerificationAction::OpenNativeDouyinLogin,
+                                        ));
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(MUTED))
+                                    .child("二维码加载不出时，可在原生窗口中直接扫码或输入。"),
+                            ),
+                    )
+                },
+            )
             .when_some(sms_instructions, |panel, sms| {
                 panel
                     .child(
@@ -906,8 +939,8 @@ impl Publisher {
             })
             .id(eid("verification-viewport", panel_id))
             .w_full()
-            .max_w(px(if sms_step == Some(DouyinLoginSms::SmsSent) {
-                820.
+            .max_w(px(if platform == Platform::Douyin {
+                840.
             } else {
                 620.
             }))

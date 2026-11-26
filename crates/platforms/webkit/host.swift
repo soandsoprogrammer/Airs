@@ -3,7 +3,7 @@ import WebKit
 
 // The helper is owned by one Airs browser session. All WebKit and AppKit
 // methods execute on the main thread; the parent communicates through pipes.
-final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, NSWindowDelegate {
     typealias Reply = (Any?, String?) -> Void
     private var view: WKWebView!
     private let window: NSWindow
@@ -25,6 +25,7 @@ final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageH
         window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         super.init()
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.contentView = view
         view.navigationDelegate = self
         view.uiDelegate = self
@@ -232,6 +233,27 @@ final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageH
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
                 self.evaluate("true", reply: reply)
             }
+        case "showDouyinLogin":
+            guard let url = view.url, url.scheme == "https", url.host == "creator.douyin.com" else {
+                reply(nil, "Official login page is unavailable"); return
+            }
+            if !window.isVisible {
+                NSApplication.shared.setActivationPolicy(.accessory)
+                window.styleMask = [.titled, .closable]
+                window.title = "Airs · 抖音登录验证"
+                if let bounds = NSScreen.main?.visibleFrame {
+                    window.setContentSize(NSSize(width: min(1440, bounds.width - 40),
+                        height: min(1000, bounds.height - 60)))
+                }
+                window.center()
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(view)
+            NSApplication.shared.activate()
+            reply(true, nil)
+        case "hideDouyinLogin":
+            hideLoginWindow()
+            reply(true, nil)
         case "snapshot":
             let config = WKSnapshotConfiguration()
             if let clip = r["clip"] as? [String: Double],
@@ -266,6 +288,20 @@ final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageH
         default:
             reply(nil, "Unsupported browser operation")
         }
+    }
+
+    private func hideLoginWindow() {
+        guard window.isVisible else { return }
+        window.orderOut(nil)
+        window.styleMask = [.borderless]
+        window.setContentSize(NSSize(width: 1440, height: 1000))
+        NSApplication.shared.setActivationPolicy(.prohibited)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Closing the verification window never destroys the active session.
+        hideLoginWindow()
+        return false
     }
 
     private func finishFrame(_ token: String, _ error: String) {
