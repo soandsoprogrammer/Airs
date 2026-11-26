@@ -408,6 +408,36 @@ final class Host: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageH
                          "request": request as Any? ?? NSNull(), "body": response])
     }
 
+    // A webpage is not permission to launch an unrelated macOS application.
+    // Intercept external navigation before WebKit hands it to Launch Services.
+    // Preserve ordinary web navigation, including in-page blobs and data URLs.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url,
+              let scheme = url.scheme?.lowercased() else {
+            decisionHandler(.cancel)
+            return
+        }
+        if ["http", "https", "about", "blob", "data"].contains(scheme) {
+            decisionHandler(.allow)
+            return
+        }
+
+        // The existing video-channel desktop login can intentionally use the
+        // installed WeChat app. It is the only supported external-app handoff.
+        let source = navigationAction.sourceFrame.securityOrigin
+        if ["weixin", "wechat"].contains(scheme),
+           source.protocol == "https",
+           ["open.weixin.qq.com", "channels.weixin.qq.com"].contains(source.host),
+           navigationAction.navigationType == .linkActivated,
+           NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+            decisionHandler(.cancel)
+            NSWorkspace.shared.open(url)
+            return
+        }
+        decisionHandler(.cancel)
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         finishNavigation(nil)
     }

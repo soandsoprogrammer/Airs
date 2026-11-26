@@ -116,6 +116,42 @@ async fn native_webkit_upload_input_and_isolation() -> anyhow::Result<()> {
         let image = first.screenshot(Some([20., 20., 300., 200.])).await?;
         assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
 
+        // Custom app links must not leave the WebKit session or show an OS prompt.
+        // Exercise redirects, iframes, and new-window link targets.
+        first
+            .evaluate::<Value>(
+                r#"(() => {
+            const frame = document.createElement('iframe');
+            frame.src = 'bitbrowser://cc/';
+            document.body.append(frame);
+            const link = document.createElement('a');
+            link.href = 'bitbrowser://cc/';
+            link.target = '_blank';
+            document.body.append(link);
+            link.click();
+            location.href = 'bitbrowser://cc/';
+            return null;
+        })()"#,
+            )
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(first.evaluate::<String>("location.href").await?, url);
+        assert_eq!(
+            first
+                .evaluate::<String>("document.querySelector('#edit').value")
+                .await?,
+            "Airs"
+        );
+        // Ordinary HTTPS and same-origin navigation must remain available.
+        first
+            .evaluate::<Value>("location.hash = 'fixture'; null")
+            .await?;
+        assert!(
+            first
+                .evaluate::<bool>("location.hash === '#fixture'")
+                .await?
+        );
+
         let endpoint = format!("{}publish", url);
         first.arm_receipts(std::slice::from_ref(&endpoint)).await?;
         first
