@@ -294,12 +294,12 @@ async fn apply_one(
     origin: &str,
     orientation: Orientation,
     image: &ImageFile,
-    allow_linked: bool,
+    linked_portrait: Option<&str>,
 ) -> Result<String> {
     let existing = wait_for_sources(page, origin, orientation, "composer", false).await?;
     let direction_bound = activate_control(page, origin, orientation, "open", false).await?;
     activate_control(page, origin, orientation, "tab", direction_bound).await?;
-    let linked_sources = if allow_linked {
+    let linked_sources = if linked_portrait.is_some() {
         let limit = Instant::now() + Duration::from_secs(5);
         loop {
             if let Observation::Point { point, sources, .. } = observe(
@@ -364,8 +364,14 @@ async fn apply_one(
             .map_err(|_| orientation.error("未显示已上传的图片，请检查封面格式后重新准备。"))??
     };
 
-    let deadline = Instant::now() + CONTROL_WAIT;
+    let deadline = Instant::now()
+        + if linked {
+            UPLOAD_WAIT + CONTROL_WAIT
+        } else {
+            CONTROL_WAIT
+        };
     let mut confirmed = false;
+    let mut stable_linked = None::<(String, Instant)>;
     while Instant::now() < deadline {
         match observe(page, origin, "confirm", orientation, &[], direction_bound).await? {
             Observation::Point { point, .. } if !confirmed => {
@@ -373,12 +379,39 @@ async fn apply_one(
                 confirmed = true;
             }
             Observation::Closed => {
+                if linked {
+                    let portrait = linked_portrait.expect("linked image has a saved portrait");
+                    let actual = observe(
+                        page,
+                        origin,
+                        "composer-linked-final",
+                        orientation,
+                        &[portrait.to_owned()],
+                        false,
+                    )
+                    .await?;
+                    if let Observation::Sources { sources } = actual
+                        && let [applied] = sources.as_slice()
+                    {
+                        match &stable_linked {
+                            Some((previous, since))
+                                if previous == applied
+                                    && since.elapsed() >= Duration::from_secs(2) =>
+                            {
+                                return Ok(applied.clone());
+                            }
+                            Some((previous, _)) if previous == applied => {}
+                            _ => stable_linked = Some((applied.clone(), Instant::now())),
+                        }
+                    } else {
+                        stable_linked = None;
+                    }
+                    sleep(POLL_INTERVAL).await;
+                    continue;
+                }
                 if let Observation::Sources { sources } =
                     observe(page, origin, "composer", orientation, &[], false).await?
                 {
-                    if linked && let [applied] = sources.as_slice() {
-                        return Ok(applied.clone());
-                    }
                     let changes = sources
                         .into_iter()
                         .filter(|source| !existing.contains(source))
@@ -413,7 +446,7 @@ pub(super) async fn apply(
     let mut snapshot = VideoCoverSnapshot::default();
     if let Some(portrait) = &covers.portrait {
         snapshot.portrait =
-            Some(apply_one(page, origin, Orientation::Portrait, portrait, false).await?);
+            Some(apply_one(page, origin, Orientation::Portrait, portrait, None).await?);
     }
     if let Some(landscape) = &covers.landscape {
         snapshot.landscape = Some(
@@ -422,7 +455,11 @@ pub(super) async fn apply(
                 origin,
                 Orientation::Landscape,
                 landscape,
-                covers.portrait.as_ref() == Some(landscape) && snapshot.portrait.is_some(),
+                if covers.portrait.as_ref() == Some(landscape) {
+                    snapshot.portrait.as_deref()
+                } else {
+                    None
+                },
             )
             .await?,
         );
@@ -601,10 +638,10 @@ mod tests {
                 if (orientation === 'landscape' && window.sameLinkedMode && window.lastPortraitFile) {
                   pending = window.lastPortraitFile;
                   const canvas = document.createElement('canvas');
-                  canvas.id = 'horizontal_coverCanvas'; canvas.width = 88; canvas.height = 64;
+                  canvas.id = 'horizontal_coverCanvas'; canvas.width = 80; canvas.height = 60;
                   get('linked-cover').after(canvas);
                   const linkedImage = new Image();
-                  linkedImage.onload = () => { canvas.getContext('2d').drawImage(linkedImage,0,0,88,64); get('done').disabled = false; };
+                  linkedImage.onload = () => { canvas.getContext('2d').drawImage(linkedImage,0,0,80,60); get('done').disabled = false; };
                   linkedImage.src = URL.createObjectURL(pending);
                 }
                 for (const item of ['portrait', 'landscape']) {
@@ -660,7 +697,18 @@ mod tests {
               });
               const save = () => {
                 // The applied asset is represented by a different URL after cropping.
-                get(current).style.backgroundImage = `url("${URL.createObjectURL(pending)}")`;
+                if (current === 'landscape' && window.sameLinkedMode) {
+                  const target = get('landscape');
+                  const canvas = get('horizontal_coverCanvas');
+                  const old = get('portrait').style.backgroundImage;
+                  target.style.backgroundImage = old;
+                  setTimeout(() => {
+                    canvas.toBlob(blob => {
+                      const img = new Image(); img.src = URL.createObjectURL(blob);
+                      target.style.backgroundImage = 'none'; target.replaceChildren(img);
+                    });
+                  }, 1200);
+                } else { get(current).style.backgroundImage = `url("${URL.createObjectURL(pending)}")`; }
                 window.saved.push(current);
                 if (current === 'portrait') window.lastPortraitFile = pending;
                 get('editor').hidden = true;
@@ -791,7 +839,7 @@ mod tests {
         page.evaluate_expression("window.sameLinkedMode = false")
             .await?;
         page.evaluate_expression(
-            "document.getElementById('landscape').style.backgroundImage = 'none'",
+            "document.getElementById('landscape').style.backgroundImage = 'none'; document.getElementById('landscape').replaceChildren()",
         )
         .await?;
         assert!(verify(&page, &origin, &snapshot).await.is_err());

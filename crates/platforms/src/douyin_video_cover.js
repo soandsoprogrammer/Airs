@@ -232,6 +232,16 @@
         .filter((element) => orientationOf(element, cover) === orientation));
     return [...new Set(nodes.map(source).filter(Boolean))].sort();
   };
+  if (action === 'composer-linked-final') {
+    // A generated landscape cover initially shares the portrait URL. Wait for
+    // the actual image resource (not the temporary portrait placeholder).
+    if (orientation !== 'landscape' || modal || find(document, '[role="dialog"], [aria-modal="true"]').length) return waiting();
+    const card = one(coverRoots().filter(node => officialCover(node) && cardOrientation(node) === 'landscape'));
+    if (!card) return waiting();
+    const candidates = [...card.querySelectorAll('img')].filter(img => rendered(img) && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0 && Math.abs(img.naturalWidth / img.naturalHeight - 4 / 3) <= 0.04);
+    const keys = [...new Set(candidates.map(source).filter(key => key && !baseline.includes(key)))];
+    return keys.length === 1 ? {status:'sources', sources:keys} : waiting();
+  }
   if (action === 'composer') {
     return modal || find(document, '[role="dialog"], [aria-modal="true"]').length
       ? waiting() : { status: 'sources', sources: composerSources() };
