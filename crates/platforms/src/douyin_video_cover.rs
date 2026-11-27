@@ -100,8 +100,16 @@ fn expression(
     orientation: Orientation,
     baseline: &[String],
     direction_bound: bool,
+    settle_animations: bool,
 ) -> String {
-    let args = serde_json::json!([origin, action, orientation.key(), baseline, direction_bound]);
+    let args = serde_json::json!([
+        origin,
+        action,
+        orientation.key(),
+        baseline,
+        direction_bound,
+        settle_animations
+    ]);
     format!("({COVER_PAGE})(...{args})")
 }
 
@@ -113,6 +121,10 @@ async fn observe(
     baseline: &[String],
     direction_bound: bool,
 ) -> Result<Observation> {
+    #[cfg(target_os = "macos")]
+    let settle_animations = page.webkit().is_some();
+    #[cfg(not(target_os = "macos"))]
+    let settle_animations = false;
     let observation = page
         .evaluate_expression(expression(
             origin,
@@ -120,6 +132,7 @@ async fn observe(
             orientation,
             baseline,
             direction_bound,
+            settle_animations,
         ))
         .await
         .and_then(|value| value.into_value::<Observation>().map_err(Into::into))
@@ -254,6 +267,7 @@ async fn upload(
         orientation,
         &[],
         direction_bound,
+        false,
     ));
     request.return_by_value = Some(false);
     let result = page
@@ -280,43 +294,75 @@ async fn apply_one(
     origin: &str,
     orientation: Orientation,
     image: &ImageFile,
+    allow_linked: bool,
 ) -> Result<String> {
     let existing = wait_for_sources(page, origin, orientation, "composer", false).await?;
     let direction_bound = activate_control(page, origin, orientation, "open", false).await?;
     activate_control(page, origin, orientation, "tab", direction_bound).await?;
-    activate_control(page, origin, orientation, "upload-pane", direction_bound).await?;
-    let preview = wait_for_sources(page, origin, orientation, "preview", direction_bound).await?;
-    upload(page, origin, orientation, image, direction_bound).await?;
-
-    let upload_finished = async {
-        let mut adjusted_crop = false;
+    let linked_sources = if allow_linked {
+        let limit = Instant::now() + Duration::from_secs(5);
         loop {
-            match observe(
+            if let Observation::Point { point, sources, .. } = observe(
                 page,
                 origin,
-                "finish",
+                "linked-ready",
                 orientation,
-                &preview,
+                &[],
                 direction_bound,
             )
             .await?
+                && !sources.is_empty()
             {
-                Observation::AdjustCrop { point } if !adjusted_crop => {
-                    click(page, orientation, point).await?;
-                    adjusted_crop = true;
-                }
-                Observation::Point { point, sources, .. } => {
-                    click(page, orientation, point).await?;
-                    return Ok::<_, anyhow::Error>(sources);
-                }
-                _ => {}
+                click(page, orientation, point).await?;
+                break Some(sources);
+            }
+            if Instant::now() >= limit {
+                break None;
             }
             sleep(POLL_INTERVAL).await;
         }
+    } else {
+        None
     };
-    let uploaded_sources = tokio::time::timeout(UPLOAD_WAIT, upload_finished)
-        .await
-        .map_err(|_| orientation.error("未显示已上传的图片，请检查封面格式后重新准备。"))??;
+    let linked = linked_sources.is_some();
+    let uploaded_sources = if let Some(sources) = linked_sources {
+        sources
+    } else {
+        activate_control(page, origin, orientation, "upload-pane", direction_bound).await?;
+        let preview =
+            wait_for_sources(page, origin, orientation, "preview", direction_bound).await?;
+        upload(page, origin, orientation, image, direction_bound).await?;
+
+        let upload_finished = async {
+            let mut adjusted_crop = false;
+            loop {
+                match observe(
+                    page,
+                    origin,
+                    "finish",
+                    orientation,
+                    &preview,
+                    direction_bound,
+                )
+                .await?
+                {
+                    Observation::AdjustCrop { point } if !adjusted_crop => {
+                        click(page, orientation, point).await?;
+                        adjusted_crop = true;
+                    }
+                    Observation::Point { point, sources, .. } => {
+                        click(page, orientation, point).await?;
+                        return Ok::<_, anyhow::Error>(sources);
+                    }
+                    _ => {}
+                }
+                sleep(POLL_INTERVAL).await;
+            }
+        };
+        tokio::time::timeout(UPLOAD_WAIT, upload_finished)
+            .await
+            .map_err(|_| orientation.error("未显示已上传的图片，请检查封面格式后重新准备。"))??
+    };
 
     let deadline = Instant::now() + CONTROL_WAIT;
     let mut confirmed = false;
@@ -330,6 +376,9 @@ async fn apply_one(
                 if let Observation::Sources { sources } =
                     observe(page, origin, "composer", orientation, &[], false).await?
                 {
+                    if linked && let [applied] = sources.as_slice() {
+                        return Ok(applied.clone());
+                    }
                     let changes = sources
                         .into_iter()
                         .filter(|source| !existing.contains(source))
@@ -363,11 +412,20 @@ pub(super) async fn apply(
 ) -> Result<VideoCoverSnapshot> {
     let mut snapshot = VideoCoverSnapshot::default();
     if let Some(portrait) = &covers.portrait {
-        snapshot.portrait = Some(apply_one(page, origin, Orientation::Portrait, portrait).await?);
+        snapshot.portrait =
+            Some(apply_one(page, origin, Orientation::Portrait, portrait, false).await?);
     }
     if let Some(landscape) = &covers.landscape {
-        snapshot.landscape =
-            Some(apply_one(page, origin, Orientation::Landscape, landscape).await?);
+        snapshot.landscape = Some(
+            apply_one(
+                page,
+                origin,
+                Orientation::Landscape,
+                landscape,
+                covers.portrait.as_ref() == Some(landscape) && snapshot.portrait.is_some(),
+            )
+            .await?,
+        );
     }
     verify(page, origin, &snapshot).await?;
     Ok(snapshot)
@@ -460,6 +518,7 @@ mod tests {
                 <input class="semi-upload-hidden-input" id="reference" type="file" hidden>
               </div>
               <div class="coverSelect-fixture">
+                <div id="linked-cover" hidden>已基于竖封面为你生成横封面。效果不满意？<button id="independent-edit">独立编辑</button></div>
                 <div role="tab" id="frames-tab">选取封面</div>
                 <div role="tab" id="upload-tab">上传封面</div>
                 <div class="container-fixture" id="upload-pane" hidden>
@@ -521,6 +580,9 @@ mod tests {
               window.standaloneSaved = false;
               window.cropDirection = 'landscape';
               window.footerSwitchClicks = 0;
+              window.independentClicks = 0;
+              window.sameLinkedMode = false;
+              window.lastPortraitFile = null;
               window.saved = [];
               let current = 'portrait';
               let pending = null;
@@ -534,6 +596,17 @@ mod tests {
                 get('preview').hidden = orientation === 'portrait';
                 get('vertical_coverCanvas').hidden = orientation !== 'portrait';
                 get('upload-pane').hidden = true;
+                get('linked-cover').hidden = orientation !== 'landscape';
+                get('horizontal_coverCanvas')?.remove();
+                if (orientation === 'landscape' && window.sameLinkedMode && window.lastPortraitFile) {
+                  pending = window.lastPortraitFile;
+                  const canvas = document.createElement('canvas');
+                  canvas.id = 'horizontal_coverCanvas'; canvas.width = 88; canvas.height = 64;
+                  get('linked-cover').after(canvas);
+                  const linkedImage = new Image();
+                  linkedImage.onload = () => { canvas.getContext('2d').drawImage(linkedImage,0,0,88,64); get('done').disabled = false; };
+                  linkedImage.src = URL.createObjectURL(pending);
+                }
                 for (const item of ['portrait', 'landscape']) {
                   get(item + '-tab').classList.toggle('step-active-fixture', item === orientation);
                 }
@@ -551,6 +624,11 @@ mod tests {
                   get('editor').hidden = false;
                 });
               }
+              get('independent-edit').addEventListener('click', event => {
+                if (!event.isTrusted) return;
+                window.independentClicks++;
+                get('linked-cover').hidden = true;
+              });
               get('upload-tab').addEventListener('click', (event) => {
                 if (!event.isTrusted) return;
                 window.uploadTabClicks++;
@@ -584,6 +662,7 @@ mod tests {
                 // The applied asset is represented by a different URL after cropping.
                 get(current).style.backgroundImage = `url("${URL.createObjectURL(pending)}")`;
                 window.saved.push(current);
+                if (current === 'portrait') window.lastPortraitFile = pending;
                 get('editor').hidden = true;
               };
               get('done').addEventListener('click', () => {
@@ -636,13 +715,61 @@ mod tests {
             portrait: Some(ImageFile::inspect(&portrait)?),
             landscape: Some(ImageFile::inspect(&landscape)?),
         };
+        #[cfg(target_os = "macos")]
+        if page.webkit().is_some() {
+            page.evaluate_expression(r#"(() => {
+              const editor = document.getElementById('editor');
+              const content = document.createElement('div');
+              content.className = 'dy-creator-content-modal-content';
+              while (editor.firstChild) content.append(editor.firstChild);
+              editor.append(content);
+              const style = document.createElement('style');
+              style.textContent = '@keyframes dy-creator-content-modal-content-keyframe-show {from {opacity:0} to {opacity:1}} .dy-creator-content-modal-content {animation:dy-creator-content-modal-content-keyframe-show 250ms both paused}';
+              document.head.append(style);
+              const unrelated = document.createElement('div');
+              unrelated.className = 'dy-creator-content-modal';
+              unrelated.innerHTML = '<div id="unrelated-animation" class="dy-creator-content-modal-content">其他验证</div>';
+              document.body.append(unrelated);
+              return null;
+            })()"#).await?;
+        }
+        #[cfg(target_os = "macos")]
+        if page.webkit().is_some() {
+            page.evaluate_expression(r#"(() => {
+              const style = document.createElement('style');
+              style.textContent = '@keyframes dy-creator-content-modal-content-keyframe-hide {from {opacity:1} to {opacity:0}} .dy-creator-content-modal-content-animate-hide {animation:dy-creator-content-modal-content-keyframe-hide 250ms both paused}';
+              document.head.append(style);
+              const closing = document.createElement('div');
+              closing.id = 'closing-cover';
+              closing.className = 'dy-creator-content-modal';
+              closing.innerHTML = '<div class="dy-creator-content-modal-content dy-creator-content-modal-content-animate-hide"><div class="steps-fixture">设置竖封面</div><div class="coverSelect-fixture">上传封面</div></div>';
+              closing.firstElementChild.addEventListener('animationend', () => closing.remove());
+              document.body.append(closing);
+              return null;
+            })()"#).await?;
+            let _ = observe(
+                &page,
+                &origin,
+                "composer",
+                Orientation::Portrait,
+                &[],
+                false,
+            )
+            .await?;
+            assert!(truth(&page, "!document.getElementById('closing-cover')").await?);
+        }
         let snapshot = apply(&page, &origin, &covers).await?;
+        #[cfg(target_os = "macos")]
+        if page.webkit().is_some() {
+            assert!(truth(&page, "getComputedStyle(document.querySelector('#unrelated-animation')).opacity === '0'").await?);
+        }
         assert!(truth(&page, r#"
             JSON.stringify(window.uploads) === '[["portrait","portrait.png"],["landscape","landscape.png"]]' &&
             window.saved.join(',') === 'portrait,landscape' &&
             window.openClicks === 3 &&
             window.openedCards.join(',') === 'portrait-card,landscape-card' &&
             window.uploadTabClicks === 2 &&
+            window.independentClicks === 1 &&
             window.directionClicks.join(',') === 'landscape' &&
             window.skippedSuggestions === 1 &&
             window.footerSwitchClicks === 0 &&
@@ -650,6 +777,19 @@ mod tests {
             window.publishClicks === 0
         "#).await?);
         verify(&page, &origin, &snapshot).await?;
+        // An independently uploaded image is mandatory for distinct files;
+        // equal files may use the positively identified platform linked preview.
+        page.evaluate_expression("window.sameLinkedMode = true")
+            .await?;
+        let same = DouyinVideoCovers {
+            portrait: covers.portrait.clone(),
+            landscape: covers.portrait.clone(),
+        };
+        let same_snapshot = apply(&page, &origin, &same).await?;
+        verify(&page, &origin, &same_snapshot).await?;
+        assert!(truth(&page, "window.uploads.length === 3 && window.independentClicks === 1 && window.saved.slice(-2).join(',') === 'portrait,landscape' && window.publishClicks === 0").await?);
+        page.evaluate_expression("window.sameLinkedMode = false")
+            .await?;
         page.evaluate_expression(
             "document.getElementById('landscape').style.backgroundImage = 'none'",
         )

@@ -1,4 +1,4 @@
-(origin, action, orientation, baseline = [], directionBound = false) => {
+(origin, action, orientation, baseline = [], directionBound = false, settleAnimations = false) => {
   const rejected = (reason) => ({ status: 'rejected', reason });
   const waiting = () => ({ status: 'waiting' });
   if (location.origin !== origin ||
@@ -20,6 +20,64 @@
   const find = (scope, selector) => [...scope.querySelectorAll(selector)].filter(visible);
   const one = (items) => items.length === 1 ? items[0] : null;
   const suggestionSelector = '[class*="verticalSupoortDualCoverModal-"]';
+  // The native background WebKit view can freeze the official cover editor's
+  // opacity/scale transition at its first frame, even after a trusted click.
+  // Complete only finite, known decorative transitions on the cover dialog.
+  // Do not reveal another dialog, bypass a disabled control, or save anything.
+  if (settleAnimations) {
+    const notified = globalThis.__airsCoverTransitionNotified ??= new WeakSet();
+    const finishTransition = (element, part) => {
+      if (!element || !rendered(element) || element.closest('[aria-hidden="true"]')) return;
+      for (const animation of element.getAnimations()) {
+        const name = animation.animationName;
+        const show = name === `dy-creator-content-modal-${part}-keyframe-show`;
+        const hide = name === `dy-creator-content-modal-${part}-keyframe-hide`;
+        if ((!show && !hide) || animation.effect?.target !== element) continue;
+        const timing = animation.effect.getTiming();
+        const frames = animation.effect.getKeyframes();
+        if (typeof timing.duration !== 'number' || timing.duration <= 0 ||
+            timing.duration > 2000 || timing.iterations !== 1 || frames.length < 2 ||
+            Number(frames[0].opacity) !== (show ? 0 : 1) ||
+            Number(frames[frames.length - 1].opacity) !== (show ? 1 : 0)) continue;
+        try {
+          if (animation.playState !== 'finished') animation.finish();
+          // The official component removes its closing overlay on animationend.
+          // In hidden WebKit the effect can finish without delivering that
+          // lifecycle event. Notify only the already-requested closing
+          // transition, once, so the site's own cleanup can run.
+          if (hide && element.isConnected && animation.playState === 'finished' &&
+              getComputedStyle(element).opacity === '0' &&
+              element.classList.contains(`dy-creator-content-modal-${part}-animate-hide`) &&
+              !notified.has(animation)) {
+            notified.add(animation);
+            element.dispatchEvent(new AnimationEvent('animationend', {
+              animationName: name, elapsedTime: timing.duration / 1000, bubbles: true
+            }));
+          }
+        } catch (_) {}
+      }
+    };
+    for (const dialog of document.querySelectorAll('.dy-creator-content-modal')) {
+      if (!rendered(dialog) || dialog.closest('[aria-hidden="true"]')) continue;
+      const title = dialog.innerText || '';
+      const isEditor = (dialog.querySelector('[class*="steps-"], [class*="single-title-"]') &&
+          /设置竖封面|设置横封面/.test(title) && /上传封面/.test(title)) ||
+        (dialog.querySelector('[class*="coverSelect-"]') && /上传封面/.test(title));
+      const isSuggestion = dialog.querySelector(suggestionSelector) &&
+        /设置横封面.{0,10}更多流量/.test(title);
+      if (!isEditor && !isSuggestion) continue;
+      const content = [...dialog.querySelectorAll('.dy-creator-content-modal-content')]
+        .filter(e => e.closest('.dy-creator-content-modal') === dialog);
+      if (content.length !== 1) continue;
+      const wrap = dialog.parentElement;
+      if (wrap?.classList.contains('dy-creator-content-modal-wrap')) {
+        const masks = [...(wrap.parentElement?.children ?? [])].filter(e =>
+          e.classList.contains('dy-creator-content-modal-mask'));
+        if (masks.length === 1) finishTransition(masks[0], 'mask');
+      }
+      finishTransition(content[0], 'content');
+    }
+  }
   const suggestions = find(document, suggestionSelector)
     .filter((node) => hasClass(node, 'verticalSupoortDualCoverModal-'));
   const suggestionRoots = new Set(suggestions.map((node) =>
@@ -236,6 +294,31 @@
       visibleCanvas?.matches(canvasId) || (tabs.length === 1 && tab === tabs[0]) ||
       Boolean(directionBound && selectPane && !tabs.length));
   if (action === 'tab') return active ? { status: 'active' } : point(tabControl);
+  // Douyin can generate the horizontal cover from the just-saved portrait.
+  // While that linked preview is shown, choosing the same file may not
+  // change the canvas. Use the platform's explicit independent edit action
+  // before attempting a separate landscape upload.
+  const linkedControls = orientation === 'landscape'
+    ? [...new Set(find(document, 'a, button, [role="button"], span, div')
+      .filter(node => label(node) === '独立编辑' &&
+        ![...node.children].some(child => visible(child) && label(child) === '独立编辑'))
+      .map(node => node.closest('a, button, [role="button"]') ?? node)
+      .filter(node => {
+        for (let parent = node.parentElement, depth = 0; parent && parent !== modal && depth < 5;
+             parent = parent.parentElement, depth++) {
+          if (/已基于竖封面为你生成横封面/.test(parent.innerText || '') &&
+              /独立编辑/.test(parent.innerText || '')) {
+            const r = node.getBoundingClientRect();
+            const m = modal.getBoundingClientRect();
+            return r.left >= m.left && r.right <= m.right && r.top >= m.top && r.bottom <= m.bottom;
+          }
+        }
+        return false;
+      }))] : [];
+  if (linkedControls.length) {
+    if (action === 'upload-pane') return point(one(linkedControls));
+    if (action === 'input') return null;
+  }
   const compactAreas = find(modal, '[class*="upload-tips-"]').filter((node) =>
     hasClass(node, 'upload-tips-') && label(node) === '上传封面').map((node) => node.parentElement);
   const dragAreas = find(selectPane ?? modal, '.semi-upload:has(.semi-upload-drag-area-main-text)')
@@ -284,6 +367,13 @@
   if (visible(coverCanvas)) evidenceNodes.push(coverCanvas);
   const sources = [...new Set(evidenceNodes.map(source).filter(Boolean))].sort();
   if (action === 'preview') return { status: 'sources', sources };
+  if (action === 'linked-ready') {
+    if (orientation !== 'landscape' || linkedControls.length !== 1 || !sources.length ||
+        find(scope, '.semi-upload-file-card-uploading, [role="progressbar"], [aria-busy="true"]').length) return waiting();
+    const done = point(one(exactControls(modal, ['完成'])));
+    if (done.status === 'point') done.sources = sources;
+    return done;
+  }
   if (action === 'finish') {
     if (!sources.some((item) => !baseline.includes(item)) ||
         find(scope, '.semi-upload-file-card-uploading, [role="progressbar"], [aria-busy="true"]').length) {
